@@ -978,7 +978,9 @@ pub(crate) fn open_fasta(
         debug!("Auto-detected FASTA file in cache directory");
         check_cache_fasta(Path::new(&path), &cache.manifest)?;
     }
-    let mut opened = vep_fasta::IndexedFasta::from_path(&path)
+    // A FASTA without its indexes is indexed beside itself before it is read
+    // (Variation/Utils/FastaSequence.pm:308-358).
+    let mut opened = vep_fasta::index::open_indexed(Path::new(&path))
         .map_err(|e| CliError::new("fasta", e.to_string()))?;
     for file in opened.files() {
         info!("Using reference FASTA: {}", file.display());
