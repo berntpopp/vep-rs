@@ -2,23 +2,24 @@
 <<panel b>>wall time per dataset and architecture
 <<panel c>>raw F1 per plugin
 <<panel d>>the plugins each tool reads
+<<panel e>>the ready-made Ensembl VEP caches that are exact, of those checked
 <<page>>
 # vep-rs
 
 vep-rs is a drop-in replacement for Ensembl VEP in Rust, with the same flags and output formats: it runs up to <<speed-up>> times faster than Ensembl VEP and matches Ensembl VEP exactly except for [the documented divergences](intended-divergences.md).
 
-It does the work of Ensembl VEP, the Variant Effect Predictor: for each variant of a VCF file it writes the genes and transcripts affected and the consequence on each. [Install](#install) a binary, a container or the source.
+It does the work of Ensembl VEP, the Variant Effect Predictor: for each variant of a VCF file it writes the genes and transcripts affected and the consequence on each. [Install](#install) a binary, a container, the Bioconda package or the source.
 
 <<if figure>>
 <figure class="home-figure">
 <a href="assets/comparison.png">
 
-![<<figure-notes>><<panel-count>> comparing <<compared>> against <<reference>>: <<panels>>.](assets/comparison.png)
+![<<figure-notes>><<panel-count>> comparing <<compared>> against <<reference>>: <<panels>>.<<if timed-apart>> Ensembl VEP's wall times are <<reference-timed>>'s figures, carried forward from the earlier reference generation.<<end timed-apart>>](assets/comparison.png)
 
 </a>
 <figcaption>
 
-<<figure-notes>><<released>> against <<reference>><<if one-comparator>>, with <<comparators>> as comparator<<end one-comparator>><<if several-comparators>>, with <<comparators>> as comparators<<end several-comparators>>.
+<<figure-notes>><<released>> against <<reference>><<if one-comparator>>, with <<comparators>> as comparator<<end one-comparator>><<if several-comparators>>, with <<comparators>> as comparators<<end several-comparators>>.<<if timed-apart>> Ensembl VEP's wall times are <<reference-timed>>'s figures, carried forward from the earlier reference generation.<<end timed-apart>>
 
 </figcaption>
 </figure>
@@ -39,6 +40,7 @@ It does the work of Ensembl VEP, the Variant Effect Predictor: for each variant 
 ```bash
 https://github.com/natera-open-source/vep-rs/releases   # Binary
 docker pull ghcr.io/natera-open-source/vep-rs:latest    # Container
+conda install -c conda-forge -c bioconda vep-rs         # Bioconda
 cargo build --release                                   # Source
 ```
 
