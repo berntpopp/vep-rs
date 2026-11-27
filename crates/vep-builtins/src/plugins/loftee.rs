@@ -539,6 +539,8 @@ struct GerpReader {
     /// The batch's first interval on a chromosome the file lacks, which
     /// counts 0 as Ensembl VEP's plugin counts it: its variant's place in the
     /// batch and its warning.
+    // ponytail: one note for the plugin, so two batches run on it at once
+    // share it; the `vep` pipeline runs one batch's plugins at a time.
     no_chromosome: Mutex<Option<(usize, Held)>>,
     /// Set once the run has warned of such an interval, so it warns once, not
     /// once per row.
