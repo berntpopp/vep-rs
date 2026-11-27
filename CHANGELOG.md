@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Output formats, columns and headers
-  - A `--output_format parquet` run that fails removes its temporary directory, since a dropped `ParquetDirectoryWriter` now waits for its encoder thread instead of leaving it writing parts.
+  - A `--output_format parquet` run that fails removes its temporary directory, since a dropped `ParquetDirectoryWriter` now waits for its encoder thread instead of leaving it writing parts. (#138)
 
 ## [1.0.0] - 2026-11-24
 
