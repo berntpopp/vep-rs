@@ -642,30 +642,99 @@ fn vcf_text(path: &Path) -> std::io::Result<String> {
 /// The error is the `OSError` of a file that cannot be opened or read.
 pub fn parse_vcf(path: &Path) -> std::io::Result<Vec<VcfVariant>> {
     let text = vcf_text(path)?;
-    let mut variants = Vec::new();
-    for line in text.split('\n') {
-        if line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        let (chrom, pos_str, vid, r#ref, alt) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
-        let pos = perl_pos(pos_str);
-        variants.push(VcfVariant {
-            chrom: chrom.to_string(),
-            pos,
-            vid: vid.to_string(),
-            r#ref: r#ref.to_string(),
-            alt: alt.to_string(),
-            variant_type: classify_variant(r#ref, alt),
-            location: normalize_location(&format!("{chrom}:{pos}")),
-            info: parts.get(7).copied().unwrap_or_default().to_string(),
-            pos_text: Some(pos_str.to_string()),
-        });
+    Ok(text
+        .split('\n')
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(vcf_variant)
+        .collect())
+}
+
+/// The record of one data line of the input; `None` for a line of fewer than five columns.
+fn vcf_variant(line: &str) -> Option<VcfVariant> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 5 {
+        return None;
     }
-    Ok(variants)
+    let (chrom, pos_str, vid, r#ref, alt) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
+    let pos = perl_pos(pos_str);
+    Some(VcfVariant {
+        chrom: chrom.to_string(),
+        pos,
+        vid: vid.to_string(),
+        r#ref: r#ref.to_string(),
+        alt: alt.to_string(),
+        variant_type: classify_variant(r#ref, alt),
+        location: normalize_location(&format!("{chrom}:{pos}")),
+        info: parts.get(7).copied().unwrap_or_default().to_string(),
+        pos_text: Some(pos_str.to_string()),
+    })
+}
+
+/// The ordinals of the input's data lines, counted from 0 as the stream counts them
+/// (`stream::Plan::force_records`), whose groups the classes that read across records must
+/// see: a record the reference may skip (`perl_skip_route`) under `reference_skipped_record`,
+/// a bracket breakend under `breakend_mate_local_read` or `bnd_own_chromosome_rows_lost`,
+/// and every record whose span lies within two bases of one of those, whose rows those
+/// classes read beside it (the rivals at a start of `skipped_record_rows`, the tuples at a
+/// Location of the two breakend classes). The rest of a file's groups are touched by none
+/// of them.
+pub fn records_read_across(
+    input: &Path,
+    skipped: bool,
+    breakends: bool,
+    max_sv_size: i64,
+) -> std::io::Result<Vec<u64>> {
+    let text = vcf_text(input)?;
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    // (ordinal, chromosome, low, high) of every record read, and the seeds among them.
+    let mut spans: Vec<(u64, String, Int, Int)> = Vec::new();
+    let mut seeds: IndexMap<String, Vec<(Int, Int)>> = IndexMap::new();
+    let data = lines.into_iter().filter(|line| !line.starts_with('#'));
+    for (ordinal, line) in (0u64..).zip(data) {
+        let Some(v) = vcf_variant(line) else {
+            continue;
+        };
+        let (_chrom, start, end) = record_location(&v);
+        let (mut lo, mut hi) = (start.min(end).min(v.pos), start.max(end).max(v.pos));
+        for (_allele, start, end) in site_rows(&v) {
+            (lo, hi) = (lo.min(start.min(end)), hi.max(start.max(end)));
+        }
+        let chrom = record_chromosome(&v).to_string();
+        let seed = (skipped && perl_skip_route(&v, max_sv_size).is_some())
+            || (breakends && v.alt.contains(['[', ']']));
+        if seed {
+            seeds
+                .entry(chrom.clone())
+                .or_default()
+                .push((minus(lo, 2), plus(hi, 2)));
+        }
+        spans.push((ordinal, chrom, lo, hi));
+    }
+    // The seeds' spans merged per chromosome, so that one search finds a record's.
+    for merged in seeds.values_mut() {
+        merged.sort_unstable();
+        let mut joined: Vec<(Int, Int)> = Vec::new();
+        for (lo, hi) in merged.drain(..) {
+            match joined.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => joined.push((lo, hi)),
+            }
+        }
+        *merged = joined;
+    }
+    Ok(spans
+        .into_iter()
+        .filter(|(_, chrom, lo, hi)| {
+            seeds.get(chrom).is_some_and(|merged| {
+                let at = merged.partition_point(|span| span.1 < *lo);
+                merged.get(at).is_some_and(|span| span.0 <= *hi)
+            })
+        })
+        .map(|(ordinal, ..)| ordinal)
+        .collect())
 }
 
 /// A transcript's `stable_id` as a key of the cache's views: a text, or a number by its
