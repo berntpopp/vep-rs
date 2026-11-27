@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-converter` refuses an `--output-dir` that is its `--json-dir` before writing anything; the conversion deleted the source's `info.json` and emptied its variation files. (#135)
 
 ## [1.0.0] - 2026-11-24
@@ -188,7 +188,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vep-cache-builder` has a library whose documented interface is `gene_model` (`read`, `Format`, `GeneModel`, `OffRecord` and one constant), the reader `vep` reads a gene-model file with. (#124)
   - The three types of the `vep-cache-builder` library are `#[non_exhaustive]` and its other modules are hidden. (#124)
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-builder --auto` installs a species of the Ensembl Genomes plants, metazoa, fungi or protists division from that site, `--release` naming the Ensembl Genomes release. (#124)
   - `vep-cache-builder --auto` refuses a bacterial or archaeal genome, any genome of a collection, and a human pangenome assembly before any download, naming what the tree lacks and cache conversion. (#124)
   - `vep-cache-builder` reads a species' core database name from the release's species list, or the `mysql/` listing, where it computed it from the assembly's trailing digits, wrong for most species. (#124)
@@ -376,7 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A caller of `vep-cli` writes `FilterConfig::default().pick_order` for `PickCriterion::DEFAULT_ORDER` and `pick::pick_order`, the type's `Default` for `TranscriptSet::from_config` and `ColocationRules::from_config`, `resolve_fork` for `Fork::resolve` and `vep_cli::apply_to_record` for `row_filter::apply_to_record`. (#124)
   - Seven public fields of `vep-cli` are hidden from the API documentation and stay public fields (`AnnotationResources::builtin_plugins`, `custom_sources`, `regulatory_source`, `cell_types`, `sv_source`, `transcript_filter` and `VcfParse::reading`); `AnnotationResources::new` and `VcfParse::default_run` fill them. (#124)
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-builder --include-predictions` refuses a species other than `homo_sapiens`, or an assembly other than GRCh37 and GRCh38, by name before any download, naming the conversion route. (#124)
   - A variation directory or site with neither per-chromosome files nor `<species>.vcf.gz` ends the build naming both; the four human-only genome-wide files raise no warning for another species. (#124)
   - `vep-cache-builder` downloads its inputs into a work directory under the cache root with `--auto` and under `--output-dir` otherwise, and removes it when the cache is in place. (#124)
@@ -437,12 +437,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The trait `vep_plugin::VepPlugin`, which nothing implemented or ran, is removed: a breaking change of the libraries; a plugin exports the C ABI of `vep_plugin::abi` from a shared library. (#124)
   - The cargo features `abi-one`, `no-feature-types` and `missing-free` of `vep-plugin`, which gated no library item, are removed: a breaking change of the libraries; a caller drops them from its `features` list. (#124)
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-converter --region-size`, accepted and ignored by the cache mode, is removed: a breaking change of the command line, which refuses the flag as an unknown argument (exit 2). (#124)
 
 ### Fixed
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `--fasta` given a FASTA without its `.fai`, or a `bgzip` FASTA without its `.gzi`, writes each beside it as `samtools faidx` writes it, as Ensembl VEP does. (#119)
   - `convert-plugin-data` writes an output named near the file-name limit and refuses one whose `.vpdi` name passes it; the scratch name did not fit. (#124)
   - `vep-cache-builder` writes `CHECKSUMS.sha256` first as a line that lists no file and last as the list, so `vep` refuses by name a directory a build left early. (#124)
@@ -846,7 +846,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - A transcript's codon table selects any of the 18 genetic codes BioPerl's `Bio::Tools::CodonTable` ships, each with its start and stop codons; a table it lacks is refused. (#115)
   - `vep-cache-builder --gtf` or `--gff3` with `--genome-fasta` builds a cache from any GTF or GFF3, read as Ensembl VEP reads a `--gtf` or `--gff` source, no protein FASTA needed. (#115)
   - A converted RefSeq or merged cache switches `--use_transcript_ref` on with Ensembl VEP's notice, writes `BAM_EDIT`, reads each edited model's cDNA and `source_cache`; `--use_given_ref` overrides. (#115)
@@ -1025,7 +1025,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--hgvs` writes no HGVSp where the description would name the stop alone on a coding sequence that no stop codon closes; Ensembl VEP names a stop there (`hgvsp_stop_named_on_incomplete_coding_sequence`). (#115)
   - `--hgvs` writes no HGVSp for an insertion left between an intron and a coding exon, where Ensembl VEP reads the inserted bases as the exon's own (`hgvsp_intron_end_insertion`). (#115)
   - The HGVSp of an insertion the 3' shift moves off the bases an edited RefSeq model holds at the start of its coding sequence is read on those bases. (#115)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-builder` settles each region's codon table from the core dumps or `--codon-table <region>=<table>`; a region named like an organelle genome that neither names refuses the build. (#115)
   - `vep-cache-builder` refuses a GFF3 or GTF line cut short of its start column, where it skipped one; a blank line and a GFF3 sequence section stay unread. (#115)
   - `vep-cache-builder` refuses a GFF3 or GTF line of four to eight columns whose start or end no number leads or whose end is negative; 0.5.0 skipped the GFF3 line. (#115)
@@ -1332,7 +1332,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The genomic description alone holds a deletion that gets no HGVSc at a transcript's first or last base. (#115)
   - `--hgvs` writes the stop at its residue number as unchanged where an insertion before the stop codon leaves the predicted protein unchanged, as the HGVS nomenclature gives it. (#115)
   - `--hgvs` writes the stop at its residue number as unchanged where an insertion inside the last residue's codon, not a whole number of codons, leaves the predicted protein unchanged. (#115)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `vep-cache-builder --include-variations` refuses a variation VCF whose `##fileformat` major version is not 4 with Ensembl VEP's message, as its dumper does; it was read. (#115)
   - `vep-cache-builder` refuses a GTF or GFF3 `version` that is no whole number or above 4294967295, and a protein FASTA header version above it, naming the file and line. (#115)
   - `vep-cache-builder` refuses a GTF line repeating a key read as one value, and an escape spelling bytes that are not UTF-8, naming the key; the last value was kept. (#115)
@@ -1528,7 +1528,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `HGVSg` is each row's own allele's notation on a record whose ALT list repeats an allele or names the reference, where Ensembl VEP prints another entry's; documented as intended. (#73)
   - A record whose alleles shift by different lengths under `--shift_3prime 1` is annotated per allele, where Ensembl VEP shares one allele's predicates; an intended divergence page states it. (#73)
   - A version-less `NC_` accession and a span past the chromosome end in SPDI input are skipped, where Ensembl VEP's database resolves both; a divergence page states it. (#73)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `storable_to_json.pl` converts every chromosome directory of a Storable cache and exports the UniProt isoforms, protein-feature labels, SIFT and PolyPhen matrices, `chr_synonyms.txt` and `contig_order`. (#73)
   - `storable_to_json.pl` refuses a Sereal cache, a shard-less cache, an unlisted chromosome and any shard that fails to read or write, with one `ERROR:` line and exit 1. (#73)
   - `cache_parity_audit.pl` classifies array elements and the new exports, so a conversion audits with no unexplained path. (#73)
@@ -1678,7 +1678,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The regulatory page states that a regulatory-only record's intergenic `SPDI` names the chromosome as the cache does in Ensembl VEP and as the FASTA does here. (#73)
   - The output page and the `--spdi` help state that a record whose reference allele ends outside `ACGTN-` (`AR/CA`) gets no `SPDI`, where Ensembl VEP's `spdi_genomic` ends the run. (#73)
   - The HGVS divergence page states that a notation every core group refuses carries the first group's message alone, where Ensembl VEP joins every group's, with tests. (#73)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - `--dir_cache`, `--species`, `--cache_version`, `--refseq` and `--merged` select the cache in Ensembl VEP's `<dir_cache>/<species>/<version>_<assembly>` layout; a run with no cache exits 1 before reading input. (#73)
   - `--assembly` must equal the cache directory's and `info.json`'s assembly (`hg19` and `hg38` read as `GRCh37` and `GRCh38`); the cache's assembly feeds headers and plugins. (#73)
   - Converted caches carry the Ensembl VEP variation files, about 23.5 GB more than 0.4.0's on GRCh38 and 21.8 on GRCh37; the `minor_allele`, `minor_allele_freq`, `AA` and `EA` fields are gone. (#73)
@@ -1774,7 +1774,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Input formats and records
   - `vep_io::input::vcf::VcfParser` and its module; the `vep` binary's line parser is the one VCF reader. (#73)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - The transcript `description` key, which Ensembl VEP's cache dumper deletes: the loader ignores it and `--transcript_filter` reads it as undefined on every cache, 0.4.0 native caches included. (#73)
 - Command line, configuration and errors
   - `--transcript_index_impl` and the `coitrees` and sorted-array transcript indexes: UCSC binning is the one overlap index, and the flag is refused as an unknown argument. (#73)
@@ -1832,7 +1832,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `HGVSg` of a trimmed allele of a `--minimal` multi-allelic record is the record-level notation Ensembl VEP prints, where it printed nothing. (#73)
   - An SPDI deletion of length 0 is skipped naming the empty span, not `Sequence name ... not valid`; Ensembl VEP keeps a `/-` feature that writes no row. (#73)
   - The `--format` help names the zero-length SPDI deletion skip and its warning beside the span-past-end skip. (#73)
-- Caches, reference FASTA and the cache tools (#135)
+- Caches, reference FASTA and the cache tools
   - A cache whose chromosome directories are symlinks loads; it was refused as holding no transcript shards. (#73)
   - `vep-cache-builder` writes a `TSA=indel` variation record with the export's alleles at its position, so a left-aligned input co-locates with a native cache as Ensembl VEP co-locates it. (#73)
   - The library `Annotator` resolves input chromosomes and breakend mates through the cache's synonyms, so a `chr21` row annotates as the `vep` binary annotates it. (#73)
