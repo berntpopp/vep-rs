@@ -29,11 +29,11 @@ cargo install vep-cli --locked
 
 The install puts the `vep` binary alone into Cargo's bin directory (`~/.cargo/bin`). The crate named `vep` on crates.io is an unrelated crate: `cargo install vep` does not install vep-rs. `vep-cache-builder` and `vep-cache-converter` are crates of their own, installed the same way; the builder links OpenSSL on Linux, as in a build from a checkout.
 
-A published crate does not carry the repository's release profile, so the install compiles under Cargo's default release profile, not the one the release archives are built with. Like a build from a checkout, it compiles for the generic CPU of its target. `RUSTFLAGS="-C target-cpu=native"` before the command builds for the machine it runs on ([CPU floor](#cpu-floor)).
+A published crate does not carry the repository's release profile, so the install compiles under Cargo's default release profile, not the one the release archives are built with. Like a Linux build from a checkout, it compiles for the generic CPU of its target. `RUSTFLAGS="-C target-cpu=native"` before the command builds for the machine it runs on ([CPU floor](#cpu-floor)).
 
 ## CPU floor
 
-A build from a checkout compiles for the generic CPU of its target, which every machine of the architecture meets: `x86-64` on Linux x86_64, `generic` on Linux aarch64, `apple-m1` on Apple silicon and `penryn` on an Intel Mac. The release archives set their CPU floor with `RUSTFLAGS`; the generic Linux archives are built for a floor almost every machine of their architecture meets:
+On Linux, a build from a checkout compiles for the generic CPU of its target, which every machine of the architecture meets: `x86-64` on x86_64 and `generic` on aarch64. On macOS, `.cargo/config.toml` sets `apple-m1` on Apple silicon and `x86-64-v3` on an Intel Mac, floors every Mac macOS 26 supports meets. Cargo reads that file from the directory a build is started in and its parents, so a Mac build is started inside the checkout. The Linux release archives set their CPU floor with `RUSTFLAGS`; the generic ones are built for a floor almost every machine of their architecture meets:
 
 | Archive | `-C target-cpu` | Runs on |
 | --- | --- | --- |
