@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `hgvs_shift_shared_across_alleles` in `vep-formats-compare` and `vep-plugin-pairs` takes a later in-frame insertion allele's `Codons` and `Amino_acids` as Ensembl VEP reads them at the moved pair.
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged.
 
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-builder --include-variations` writes four chromosomes' variation files at once, unchanged: half the wall time on GRCh38 chromosomes 21, 22, Y and MT, with twice the memory.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
