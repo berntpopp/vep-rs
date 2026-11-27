@@ -98,7 +98,7 @@ use count::counted;
 /// at a time is refused beside any of them.
 const INSTALL_FLAGS: [&str; 3] = ["auto", "dir_cache", "site"];
 
-/// The chromosomes whose variation files are written at once.
+/// The most chromosomes whose variation files are written at once.
 const CHROMOSOMES_IN_FLIGHT: usize = 4;
 
 #[derive(Parser)]
@@ -1077,7 +1077,10 @@ fn write_variation_files(
             vcf.path().display()
         );
     }
-    let written = write_until_failure(&from_vcfs, CHROMOSOMES_IN_FLIGHT, |(chrom, vcf)| {
+    // `RAYON_NUM_THREADS=1` sizes the global pool to one, which writes one
+    // chromosome at a time.
+    let threads = CHROMOSOMES_IN_FLIGHT.min(rayon::current_num_threads());
+    let written = write_until_failure(&from_vcfs, threads, |(chrom, vcf)| {
         variation::write_chromosome(
             chrom,
             vcf,
