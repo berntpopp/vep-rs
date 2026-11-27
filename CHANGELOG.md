@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Library crates
+  - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once.
+
 ### Changed
 
 - Dependencies and tooling
