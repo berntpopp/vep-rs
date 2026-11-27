@@ -797,7 +797,7 @@ fn grouped(entries: &[&Entry], examples: i64) -> Value {
 /// counted under the class. `MERGED_SAME_STABLE_ID_COLLAPSE` in `documented.masks`
 /// accepts a Transcript entry the candidate alone writes, of a model the reference wrote no row
 /// for on a record it wrote a Transcript row for, its SOURCE RefSeq or absent (absent only
-/// where a row compared carries REFSEQ_MATCH), once per record and allele, counted under the
+/// where a reference row carries REFSEQ_MATCH), once per record and allele, counted under the
 /// class, and leaves such a record's `most_severe_consequence` uncompared.
 /// Each class of `TERM_PAIR_CLASSES` in `documented.masks` accepts the
 /// Consequence of a pair its predicate admits, the row counted once and its other fields
@@ -1001,12 +1001,12 @@ pub fn compare_entries<'a>(
         // A lost copy's row once per record and allele: a repeat of one is a duplicate, whatever
         // the format's key spells (the text key omits the Uploaded_variation the label carries).
         let mut accepted_rows: HashSet<(String, &str, &str)> = HashSet::new();
-        // A row without SOURCE is a RefSeq cache's only where the rows compared carry
-        // REFSEQ_MATCH, which a run under neither `--refseq` nor `--merged` never writes.
-        let refseq_run = expected.iter().chain(actual).any(|e| {
-            REFSEQ_MATCH_FIELDS
-                .iter()
-                .any(|f| e.fields.contains_key(*f))
+        // A row without SOURCE is a RefSeq cache's only where the reference's rows, those
+        // kept back included, carry REFSEQ_MATCH, which a run under neither `--refseq` nor
+        // `--merged` writes.
+        let refseq_run = REFSEQ_MATCH_FIELDS.iter().any(|f| {
+            expected.iter().any(|e| e.fields.contains_key(*f))
+                || kept.is_some_and(|k| k.populated.get(f) > 0 || k.present.contains(*f))
         });
         for a in actual {
             if expected_keys.contains(a.key.as_str()) || documented.extra(a) || !transcript_entry(a)
