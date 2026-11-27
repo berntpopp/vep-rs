@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-converter verify` holds a `.vpd` store to the whole SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep that check at open.
 - Library crates
   - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once.
 
@@ -29,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads.
   - Tabix tables indexed on their start column alone (`gnomADc`, `CADD`, `SpliceAI` and others) read only each batch's own windows, side by side: 56 percent less wall time for `gnomADc` on ClinVar chr21, 16 threads.
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file.
+  - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store.
 - Caches, reference FASTA and the cache tools
   - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged.
