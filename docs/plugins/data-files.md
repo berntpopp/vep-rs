@@ -194,8 +194,12 @@ Run it after copying or restoring a store, or whenever a data file may have
 been edited in place. A store whose index is of version 5, which records no
 sampled digest, is held to the whole files' SHA256 on every open.
 
-The index ends with the SHA256 of its own bytes. A plugin refuses a store whose
-index differs from that digest, as an index altered or cut short does. It also
+The index ends with its own length, the SHA256 of its bytes and a sampled
+digest of its first and last MiB. Every open checks the length and the sampled
+digest, so a plugin refuses an index cut short, or altered in those MiB. An
+index altered at the same length between them opens; `verify` checks the
+index's full SHA256 too and refuses it. A version 5 index is held to its full
+SHA256 on every open. It also
 refuses an index that names one chromosome twice, or that holds a chromosome's
 positions out of ascending order.
 
@@ -205,10 +209,11 @@ An `INFO` line names what each plugin reads: the store, with the data file's
 path and both SHA256 values, or the data file.
 
 The data file must stay beside its store: each open reads the first and last
-MiB of both to check them, which takes milliseconds whatever the files' sizes.
-The index itself is read whole for its own digest. `verify`, and an open of a
-version 5 index, read both files whole, which takes seconds for files of
-several gigabytes where both are in memory.
+MiB of the data file, the store's `.vpd` and its index to check them. Each
+open then reads the index's position entries once, in order, to check that
+they ascend. `verify`, and an open of a version 5 index, read all three files
+whole, which takes seconds for files of several gigabytes where they are in
+memory.
 
 ## How a row's cells are read
 

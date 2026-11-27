@@ -25,7 +25,9 @@
 //!   by its start can lie and still reach into the query
 //! - Per-chromosome position index: sorted array of `(position: u64, data_offset: u64, record_count: u32)`,
 //!   one entry per distinct position, `data_offset` into the `.vpd` file
-//! - Digest: the SHA256 of every byte before it, the file's last 32 bytes
+//! - Trailer: the SHA256 of every byte before it, their count `u64`, and
+//!   their sampled digest, the file's last 72 bytes (a version 5 index ends
+//!   with the SHA256 alone)
 //!
 //! **Data file (`.vpd`)**: large, memory-mapped:
 //! - Header: magic `VPDA`, version `u32`, column count `u16`
@@ -54,9 +56,12 @@
 //! index of version 5, which records no sampled digest, is held to the whole
 //! files' SHA256 on every open.
 //!
-//! The index answers for its own bytes as well: it ends with the SHA256 of
-//! every byte before that digest, and an index whose bytes differ from it is
-//! refused before any of its counts is read. An index naming one chromosome
+//! The index answers for its own bytes as well: every open holds the bytes
+//! before its trailer to the count and the sampled digest the trailer
+//! records before any of its counts is read, and [`BinaryAnnotator::verify`]
+//! holds them to its SHA256 too, as every open holds a version 5 index. A
+//! change of the same length between the index's first and last MiB is seen
+//! by `verify` alone. An index naming one chromosome
 //! twice, or holding a chromosome's positions out of ascending order, is
 //! refused naming the chromosome.
 //!
@@ -101,6 +106,9 @@ const UNSAMPLED_INDEX_VERSION: u32 = 5;
 pub const SAMPLE_BYTES: u64 = 1 << 20;
 /// The bytes of the SHA256 digest an index ends with.
 const INDEX_DIGEST_BYTES: usize = 32;
+/// The bytes a version 6 index ends with: the SHA256 of the bytes before
+/// them, their count, and their sampled digest ([`sampled_digest`]).
+const INDEX_TRAILER_BYTES: usize = INDEX_DIGEST_BYTES + 8 + 32;
 /// The conversion that rebuilds a store, as a store's refusals name it.
 const RECONVERT: &str = "convert the table again with vep-cache-converter convert-plugin-data";
 
@@ -566,7 +574,7 @@ impl BinaryAnnotator {
     /// [`Self::open`]'s refusals.
     pub fn verify(vpd_path: &Path, table: &Path) -> Result<(), PluginError> {
         let files = StoreFiles::read(vpd_path)?;
-        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"))?;
+        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"), true)?;
         index.check_sampled(vpd_path, &files.data, table)?;
         index.check_whole(vpd_path, &files.data, table)
     }
@@ -675,7 +683,7 @@ impl BinaryAnnotator {
         files: StoreFiles,
         config: &TabixConfig,
     ) -> Result<Self, PluginError> {
-        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"))?;
+        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"), false)?;
         let layout = Layout::of(config)?;
         if index.layout != layout {
             return Err(PluginError::Init(format!(
@@ -736,7 +744,7 @@ impl BinaryAnnotator {
     /// a refusal: the magic, then the version, then the digest the index ends
     /// with, held to the bytes before it, and only then the counts and the
     /// entries, which lie before that digest.
-    fn load_index(bytes: &[u8], index_path: &Path) -> Result<VpdIndex, PluginError> {
+    fn load_index(bytes: &[u8], index_path: &Path, whole: bool) -> Result<VpdIndex, PluginError> {
         let mut cursor = io::Cursor::new(bytes);
 
         let mut magic = [0u8; 4];
@@ -745,7 +753,7 @@ impl BinaryAnnotator {
         let version = read_u32(&mut cursor)?;
         index_version(version)?;
 
-        let mut cursor = io::Cursor::new(index_body(bytes, index_path)?);
+        let mut cursor = io::Cursor::new(index_body(bytes, index_path, version, whole)?);
         cursor.set_position(4 + 4);
         let layout = Layout::read_from(&mut cursor)?;
         let source = ContentIdentity::read_from(&mut cursor, version)?;
@@ -1802,7 +1810,12 @@ impl BinaryStoreStream {
             .into_inner()
             .map_err(|e| write_err(e.into_error()))?;
         let (mut index_file, digest) = hashed.finish();
-        index_file.write_all(&digest).map_err(write_err)?;
+        let body_length = index_file.stream_position().map_err(write_err)?;
+        let sampled = sampled_digest(index_file, body_length).map_err(write_err)?;
+        index_file.seek(io::SeekFrom::End(0)).map_err(write_err)?;
+        for field in [&digest[..], &body_length.to_le_bytes(), &sampled] {
+            index_file.write_all(field).map_err(write_err)?;
+        }
         let index_size = self.scratch.index.metadata().map(|m| m.len()).unwrap_or(0);
 
         // A numbered scratch file is another conversion's to remove once the
@@ -2385,9 +2398,16 @@ fn merge_intervals(intervals: &[(u64, u64)]) -> Vec<(u64, u64)> {
     merged
 }
 
-/// The bytes of an index before the digest it ends with, once they hash to
-/// that digest; the refusal names `index_path` otherwise.
-fn index_body<'a>(bytes: &'a [u8], index_path: &Path) -> Result<&'a [u8], PluginError> {
+/// The bytes of an index before the trailer it ends with, once they match it:
+/// in a version 6 index their count and sampled digest, and their SHA256 too
+/// where `whole` asks or the index is of version 5, which ends with that
+/// digest alone. The refusal names `index_path` otherwise.
+fn index_body<'a>(
+    bytes: &'a [u8],
+    index_path: &Path,
+    version: u32,
+    whole: bool,
+) -> Result<&'a [u8], PluginError> {
     let refusal = |difference: std::fmt::Arguments| {
         PluginError::Init(format!(
             "store index differs from its own digest: the index file {} {difference}; {RECONVERT}",
@@ -2400,11 +2420,44 @@ fn index_body<'a>(bytes: &'a [u8], index_path: &Path) -> Result<&'a [u8], Plugin
             bytes.len()
         )));
     };
+    let (body, recorded) = if version == UNSAMPLED_INDEX_VERSION {
+        (body, recorded)
+    } else {
+        let Some((body, trailer)) = bytes.split_last_chunk::<INDEX_TRAILER_BYTES>() else {
+            return Err(refusal(format_args!(
+                "holds {} bytes, fewer than the {INDEX_TRAILER_BYTES} of the trailer it ends with",
+                bytes.len()
+            )));
+        };
+        let (recorded, rest) = trailer.split_first_chunk::<INDEX_DIGEST_BYTES>().unwrap();
+        let (length, sampled) = rest.split_first_chunk::<8>().unwrap();
+        let sampled: &Digest = sampled.try_into().unwrap();
+        let length = u64::from_le_bytes(*length);
+        if length != body.len() as u64 {
+            return Err(refusal(format_args!(
+                "holds {} bytes before its trailer, which records {length}",
+                body.len()
+            )));
+        }
+        let found = sampled_digest(io::Cursor::new(body), length).map_err(read_err)?;
+        if found != *sampled {
+            return Err(refusal(format_args!(
+                "has SHA256 {} over its first and last MiB, which its trailer records {}",
+                hex(&found),
+                hex(sampled)
+            )));
+        }
+        if !whole {
+            return Ok(body);
+        }
+        (body, recorded)
+    };
     let found = HashingReader::new(body).digest_to_end().map_err(read_err)?;
     if found != *recorded {
         return Err(refusal(format_args!(
-            "has SHA256 {} before its last {INDEX_DIGEST_BYTES} bytes, which record {}",
+            "has SHA256 {} before its last {} bytes, which record {}",
             hex(&found),
+            bytes.len() - body.len(),
             hex(recorded)
         )));
     }
@@ -2507,14 +2560,16 @@ mod tests {
     const IDENTITY_AT: usize = 4 + 4 + 4 * 2 + 1;
     /// The bytes of one identity: a SHA256 digest and a length.
     const IDENTITY_BYTES: usize = 32 + 8 + 32;
-    /// The bytes of the SHA256 digest an index ends with.
-    const DIGEST_BYTES: usize = INDEX_DIGEST_BYTES;
+    /// The bytes of the trailer an index ends with.
+    const DIGEST_BYTES: usize = INDEX_TRAILER_BYTES;
 
-    /// `body` followed by the SHA256 of its bytes, as the writer ends an
-    /// index.
+    /// `body` followed by the trailer the writer ends an index with: the
+    /// SHA256 of its bytes, their count and their sampled digest.
     fn sealed(body: &[u8]) -> Vec<u8> {
         let digest = HashingReader::new(body).digest_to_end().unwrap();
-        [body, &digest[..]].concat()
+        let length = body.len() as u64;
+        let sampled = sampled_digest(io::Cursor::new(body), length).unwrap();
+        [body, &digest[..], &length.to_le_bytes(), &sampled[..]].concat()
     }
 
     /// `index` with the digest it ends with replaced by the SHA256 of the
@@ -3560,7 +3615,8 @@ mod tests {
             v5.extend_from_slice(&body[at..at + 32 + 8]);
         }
         v5.extend_from_slice(&body[IDENTITY_AT + 2 * IDENTITY_BYTES..]);
-        std::fs::write(&vpdi_path, sealed(&v5)).unwrap();
+        let v5_digest = HashingReader::new(&v5[..]).digest_to_end().unwrap();
+        std::fs::write(&vpdi_path, [&v5[..], &v5_digest[..]].concat()).unwrap();
         std::fs::write(&table, &bytes).unwrap();
         let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
         assert_eq!(store.query("21", 200, 200).unwrap().len(), 1);
@@ -3573,6 +3629,71 @@ mod tests {
                 && !refused.contains("first and last MiB"),
             "{refused}"
         );
+    }
+
+    /// An index of more than two MiB is held at open to its length and the
+    /// digest of its first and last MiB: a byte altered in either is refused
+    /// by every open, and one altered between them opens and is refused by
+    /// `verify` alone, which holds the whole index to its SHA256.
+    #[test]
+    fn an_index_is_held_to_its_sampled_bytes_at_open_and_to_its_whole_digest_by_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpd_path = dir.path().join("wide.vpd");
+        let vpdi_path = vpd_path.with_extension("vpdi");
+        let (config, source) = with_source(&vpd_path, TabixConfig::default());
+        let column_names: Vec<String> = ["chr", "pos", "score"].map(String::from).to_vec();
+        let records: Vec<TabixRecord> = (1..=150_000u64)
+            .map(|position| TabixRecord {
+                chr: "21".to_string(),
+                start: position,
+                end: position,
+                columns: vec!["21".into(), position.to_string(), "1".into()],
+                header: Some(Arc::new(column_names.clone())),
+            })
+            .collect();
+        BinaryStoreWriter::new(vpd_path.clone())
+            .write(
+                &column_names,
+                &[("21".to_string(), records)],
+                &config,
+                &source,
+            )
+            .unwrap();
+        let index = std::fs::read(&vpdi_path).unwrap();
+        assert!(index.len() as u64 > 2 * SAMPLE_BYTES);
+        let opened = |patched: &[u8]| {
+            std::fs::write(&vpdi_path, patched).unwrap();
+            BinaryAnnotator::open(&vpd_path, &config)
+                .err()
+                .map_or_else(|| "the store opened".to_string(), |e| e.to_string())
+        };
+        let verified = || match BinaryAnnotator::verify(&vpd_path, &config.file_path) {
+            Err(error) => error.to_string(),
+            Ok(()) => "the store verified".to_string(),
+        };
+        let by_its_digest = format!(
+            "plugin initialization failed: store index differs from its own digest: the index \
+             file {} ",
+            vpdi_path.display()
+        );
+        // A data offset's byte inside each sampled MiB, and one between them.
+        let entry_byte = |near: usize| {
+            let first_entry = IDENTITY_AT + 2 * IDENTITY_BYTES + 4 + 2 + 2 + 8 + 8;
+            first_entry + (near - first_entry) / 20 * 20 + 8
+        };
+        for at in [entry_byte(1000), entry_byte(index.len() - 1000)] {
+            let mut patched = index.clone();
+            patched[at] ^= 1;
+            let refused = opened(&patched);
+            assert!(refused.starts_with(&by_its_digest), "byte {at}: {refused}");
+        }
+        let mut middle = index.clone();
+        middle[entry_byte(index.len() / 2)] ^= 1;
+        assert_eq!(opened(&middle), "the store opened");
+        let refused = verified();
+        assert!(refused.starts_with(&by_its_digest), "{refused}");
+        assert_eq!(opened(&index), "the store opened");
+        assert_eq!(verified(), "the store verified");
     }
 
     /// The identity lies in the index after the layout, and a byte altered in

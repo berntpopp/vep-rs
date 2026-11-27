@@ -3813,13 +3813,18 @@ mod tests {
         assert_eq!(cells, [["21", "100", "A", "0.5\u{FFFD}"]]);
     }
 
-    /// `index` with the digest it ends with replaced by the SHA256 of the
-    /// bytes before it, as the writer seals an index: a test that alters a
-    /// field seals the index again to reach the check behind the digest.
+    /// `index` with the trailer it ends with written again for the bytes
+    /// before it, as the writer seals an index: a test that alters a field
+    /// seals the index again to reach the check behind the trailer.
     fn resealed(index: &[u8]) -> Vec<u8> {
-        let body = &index[..index.len() - 32];
+        let body = &index[..index.len() - (32 + 8 + 32)];
         let digest = HashingReader::new(body).digest_to_end().unwrap();
-        [body, &digest[..]].concat()
+        // A body under one MiB is sampled whole from each end.
+        let sampled = HashingReader::new(&[body, body].concat()[..])
+            .digest_to_end()
+            .unwrap();
+        let length = (body.len() as u64).to_le_bytes();
+        [body, &digest[..], &length[..], &sampled[..]].concat()
     }
 
     /// A store the verification faults is removed where it was published: an
