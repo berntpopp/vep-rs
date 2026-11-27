@@ -148,12 +148,21 @@ impl<R: BufRead> RegionParser<R> {
         let chr = region.chr.to_string();
         let mut variant = if sequence {
             let reference = if start <= end {
-                "N".repeat((end - start + 1) as usize)
+                let mut reference = Vec::new();
+                usize::try_from(end - start + 1)
+                    .ok()
+                    .filter(|&n| reference.try_reserve_exact(n).is_ok())
+                    .map(|n| reference.resize(n, b'N'))
+                    .ok_or_else(|| {
+                        IoError::Unsupported(format!(
+                            "variant size ({span}) cannot be held in memory"
+                        ))
+                    })?;
+                reference
             } else {
-                "-".to_string()
+                b"-".to_vec()
             };
-            let mut variant =
-                InputVariant::new(chr, start, end, reference.into_bytes(), allele.into_bytes());
+            let mut variant = InputVariant::new(chr, start, end, reference, allele.into_bytes());
             // `post_process_vfs` runs `minimise_alleles` before the lookup replaces
             // the placeholder, on every bi-allelic record under `--minimal`
             // (Parser.pm:852) and otherwise on a record whose alleles differ in
@@ -625,6 +634,19 @@ mod tests {
     /// is the minimised record's: `21:1-1002/N` shares its first `N` with the
     /// run, so `minimise_alleles` leaves `N` x 1001 over 2 to 1002 and the span
     /// 1000 passes where `21:1-1002/G` is refused.
+    /// Under `--max_sv_size -1` a span no allocation can hold ends the run with
+    /// the input's refusal, as Ensembl VEP dies building its `'N' x` reference
+    /// (Parser/Region.pm:189), instead of aborting the process.
+    #[test]
+    fn a_span_past_memory_is_refused_under_no_size_limit() {
+        let error = record(&format!("21:1-{MAX_COORD}/G")).unwrap_err();
+        assert!(matches!(error, IoError::Unsupported(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            format!("variant size ({}) cannot be held in memory", MAX_COORD - 1)
+        );
+    }
+
     #[test]
     fn oversize_span_refused_before_the_reference_is_built() {
         let context = ParserContext {
