@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Output formats, columns and headers
   - A `--output_format parquet` run that fails removes its temporary directory, since a dropped `ParquetDirectoryWriter` now waits for its encoder thread instead of leaving it writing parts.
 
+### Fixed
+
+- Transcript attributes, predictions and consequences
+  - `Amino_acids` translates a codon holding a byte outside the IUPAC alphabet as `X`, as BioPerl and the consequence terms read it, instead of as `N`.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
