@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Caches, reference FASTA and the cache tools
   - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build.
 
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-builder` reads the SIFT and PolyPhen matrix dump with the reader of every other table dump, so a row with a column past the third is read as its first three.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
