@@ -1465,7 +1465,7 @@ pub(crate) fn shard_start(path: &Path) -> (u64, String) {
 /// The first and last position of the region a shard's file name states
 /// (`<start>-<end>.json`, or the same under `.json.gz`); `None` for a name of
 /// another shape.
-fn shard_span(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn shard_span(path: &Path) -> Option<(u64, u64)> {
     let name = path.file_name()?.to_str()?;
     let range = name
         .strip_suffix(".json.gz")
@@ -1654,10 +1654,50 @@ pub(crate) fn load_transcripts_in_set_with(
     keep_exon_ids: bool,
     keep_predictions: bool,
 ) -> anyhow::Result<LoadedTranscripts> {
+    let options = ShardOptions {
+        set,
+        keep_exon_ids,
+        keep_predictions,
+    };
+    let parsed = parse_shards(chr, shards, manifest, options);
+    merge_shards(parsed, shards)
+}
+
+/// How [`parse_shards`] reads each shard: the run's transcript set and the
+/// keys [`load_transcripts_in_set_with`] keeps.
+#[derive(Clone, Copy)]
+pub(crate) struct ShardOptions<'a> {
+    pub set: Option<&'a TranscriptSet>,
+    pub keep_exon_ids: bool,
+    pub keep_predictions: bool,
+}
+
+/// One shard's transcripts as [`parse_shards`] reads them, before the
+/// chromosome's copies are merged ([`merge_shards`]), with the lowest start of
+/// any record the shard holds, the set's filter aside.
+pub(crate) struct ParsedShard {
+    transcripts: Vec<Transcript>,
+    tally: GencodeTally,
+    pub lowest_start: Option<i64>,
+}
+
+/// Parses `shards` in parallel on the global pool, each checked against
+/// `manifest`, into the transcripts the run's set admits.
+pub(crate) fn parse_shards(
+    chr: &str,
+    shards: &[PathBuf],
+    manifest: &CacheManifest,
+    options: ShardOptions<'_>,
+) -> Vec<anyhow::Result<ParsedShard>> {
+    let ShardOptions {
+        set,
+        keep_exon_ids,
+        keep_predictions,
+    } = options;
     let gencode_attribute = set.and_then(TranscriptSet::gencode_attribute);
-    let parsed: Vec<anyhow::Result<(Vec<Transcript>, GencodeTally)>> = shards
+    shards
         .par_iter()
-        .map(|path| -> anyhow::Result<(Vec<Transcript>, GencodeTally)> {
+        .map(|path| -> anyhow::Result<ParsedShard> {
             let data = read_shard(path, manifest)?;
             let json_transcripts = parse_shard_transcripts(&data, keep_exon_ids, keep_predictions)
                 .with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -1671,6 +1711,7 @@ pub(crate) fn load_transcripts_in_set_with(
                 },
                 None => GencodeTally::default(),
             };
+            let lowest_start = json_transcripts.iter().map(|jt| jt.start).min();
             let mut codes = AttributeCodes::default();
             let mut transcripts: Vec<Transcript> = json_transcripts
                 .into_iter()
@@ -1687,10 +1728,22 @@ pub(crate) fn load_transcripts_in_set_with(
                     .map_err(|message| CliError::new("cache", message))?;
             }
             copy_hgnc_ids_to_refseq_models(&mut transcripts);
-            Ok((transcripts, tally))
+            Ok(ParsedShard {
+                transcripts,
+                tally,
+                lowest_start,
+            })
         })
-        .collect();
+        .collect()
+}
 
+/// The chromosome's transcripts from the parses of `shards`, in the shards'
+/// order: each transcript once, held to the region files it was read from, and
+/// ranked.
+pub(crate) fn merge_shards(
+    parsed: Vec<anyhow::Result<ParsedShard>>,
+    shards: &[PathBuf],
+) -> anyhow::Result<LoadedTranscripts> {
     // A cache converted from VEP's region files stores a gene's transcripts in
     // every 1 Mb shard the gene overlaps, so the same transcript arrives from two
     // shards; VEP de-duplicates them by dbID on load, and so does this loader,
@@ -1706,7 +1759,9 @@ pub(crate) fn load_transcripts_in_set_with(
     let mut seen: HashMap<TranscriptKey, usize> = HashMap::new();
     let mut read_from: Vec<Vec<Option<(u64, u64)>>> = Vec::new();
     for (item, shard) in parsed.into_iter().zip(shards) {
-        let (transcripts, tally) = item?;
+        let ParsedShard {
+            transcripts, tally, ..
+        } = item?;
         gencode.add(tally);
         let span = shard_span(shard);
         for t in transcripts {

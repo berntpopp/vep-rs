@@ -60,7 +60,8 @@ use crate::row_filter::RowFilters;
 use crate::stats;
 use crate::sv_source::{self, SvSource};
 use crate::transcript_index::{
-    LazyTranscriptIndexes, TranscriptIndex, TranscriptSet, UnreadNotations,
+    BatchTranscripts, ChromosomeIndexes, LazyTranscriptIndexes, Reach, TranscriptIndex,
+    TranscriptSet, UnreadNotations,
 };
 use crate::transcript_lookup::TranscriptLookup;
 use crate::variation_matcher::{self, ColocationRules};
@@ -3224,7 +3225,6 @@ impl Runner {
             let mut run_stats = accumulators.into_run_stats();
             run_stats.set_lines_read(outcome.lines_read);
             run_stats.set_filtered(stats.records_filtered.load(Ordering::Relaxed));
-            run_stats.resolve_transcripts(&annotation_resources.transcripts);
             if !stats_files.is_empty() {
                 let ctx = stats::ReportContext {
                     vep_version: format!("{}.{}", vep_core::VEP_VERSION, vep_core::VEP_SUB_VERSION),
@@ -4101,8 +4101,32 @@ impl AnnotationResources {
     }
 
     /// Materialize chromosome-scoped caches before either streaming or batch workers run.
-    pub(crate) fn prewarm_chromosome(&self, chr: &str) -> anyhow::Result<()> {
-        pipeline::prewarm_chromosome(&self.transcripts, self.regulatory_source.as_deref(), chr)
+    /// One batch's transcript indexes over `reaches`
+    /// ([`LazyTranscriptIndexes::snapshot`]), with each chromosome's
+    /// regulatory features warmed under `--regulatory`.
+    pub(crate) fn hold_batch(
+        &self,
+        reaches: Vec<(String, Reach)>,
+    ) -> anyhow::Result<Arc<BatchTranscripts>> {
+        let names: Vec<String> = match self.regulatory_source {
+            Some(_) => reaches.iter().map(|(chr, _)| chr.clone()).collect(),
+            None => Vec::new(),
+        };
+        let batch = self.transcripts.snapshot(reaches)?;
+        if let Some(source) = self.regulatory_source.as_deref() {
+            for chr in &names {
+                source
+                    .prewarm(chr)
+                    .map_err(pipeline::regulatory_load_error)?;
+            }
+        }
+        Ok(Arc::new(batch))
+    }
+
+    /// Whether every record reaches its whole chromosome: `--nearest` reads
+    /// the start sites of the whole chromosome.
+    pub(crate) fn reaches_whole_chromosomes(&self) -> bool {
+        self.nearest.is_some()
     }
 
     pub(crate) fn synonyms(&self) -> &ChromosomeSynonyms {
@@ -4213,8 +4237,8 @@ pub(crate) fn prewarm_batch(
     batch: &[InputVariant],
     resources: &AnnotationResources,
     pool: &ThreadPool,
-) -> anyhow::Result<()> {
-    prewarm_chromosomes(batch, resources)?;
+) -> anyhow::Result<Arc<BatchTranscripts>> {
+    let transcripts = prewarm_chromosomes(batch, resources)?;
     if resources.known_variant_source_active() {
         let (variation, svs) = pool.install(|| fetch_known_variants(batch, resources, true));
         let mut prefetch = BatchPrefetch {
@@ -4224,7 +4248,7 @@ pub(crate) fn prewarm_batch(
         };
         install_prefetch(resources, &mut prefetch);
     }
-    Ok(())
+    Ok(transcripts)
 }
 
 /// Materializes every chromosome a batch touches, serially and outside the pool.
@@ -4246,15 +4270,26 @@ pub(crate) fn prewarm_batch(
 pub(crate) fn prewarm_chromosomes(
     batch: &[InputVariant],
     resources: &AnnotationResources,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<BatchTranscripts>> {
+    let whole = resources.reaches_whole_chromosomes();
+    let mut reaches: Vec<(String, Reach)> = Vec::new();
+    let mut push =
+        |chr: &str, span: Option<(u64, u64)>| match reaches.iter_mut().find(|(c, _)| c == chr) {
+            Some((_, reach)) => reach.add(span),
+            None => reaches.push((chr.to_string(), Reach::of(span))),
+        };
     for variant in batch {
-        pipeline::prewarm_variant_chromosomes(
-            &resources.transcripts,
-            resources.regulatory_source.as_deref(),
-            variant,
-        )?;
+        let whole = whole || variant.is_structural || variant.mate_chr.is_some();
+        let (start, end) = structural_variant_bounds(variant);
+        push(
+            &variant.chr,
+            (!whole).then(|| resources.transcripts.reach(start, end)),
+        );
+        if let Some(mate_chr) = variant.mate_chr.as_deref() {
+            push(mate_chr, None);
+        }
     }
-    Ok(())
+    resources.hold_batch(reaches)
 }
 
 /// What was read ahead for one batch before its annotation: the variation
@@ -4452,11 +4487,12 @@ impl RecordWarnings {
 pub(crate) fn annotate_one(
     variant: &mut InputVariant,
     resources: &AnnotationResources,
+    transcripts: &BatchTranscripts,
     failure: &ReadFailure,
 ) -> u64 {
     // Every record of the buffer, a breakend on its own chromosome and a record
     // with no allele to annotate included (AnnotationType/Transcript.pm:170-174).
-    crate::nearest::annotate(variant, resources.transcripts.as_ref(), resources.nearest);
+    crate::nearest::annotate(variant, transcripts, resources.nearest);
     if variant.no_allele {
         return 0;
     }
@@ -4481,7 +4517,7 @@ pub(crate) fn annotate_one(
             .unwrap_or(false);
     let transcript_filter = resources.transcript_filter.as_deref();
     if !is_interchrom_paired_breakend {
-        if let Some(chr_transcripts) = resources.transcripts.get(&variant.chr) {
+        if let Some(chr_transcripts) = transcripts.get(&variant.chr) {
             annotate_variant(
                 variant,
                 chr_transcripts,
@@ -4494,7 +4530,7 @@ pub(crate) fn annotate_one(
 
     append_bnd_mate_consequences(
         variant,
-        resources.transcripts.as_ref(),
+        transcripts,
         &resources.effects_config,
         transcript_filter,
     );
@@ -4665,6 +4701,7 @@ pub(crate) fn count_indels_on_edited_models(
 pub(crate) fn note_notations_the_reference_lacks(
     slice: &[InputVariant],
     resources: &AnnotationResources,
+    transcripts: &BatchTranscripts,
 ) {
     let config = &resources.effects_config;
     let Some(fasta) = config.reference_fasta.as_deref() else {
@@ -4713,7 +4750,9 @@ pub(crate) fn note_notations_the_reference_lacks(
                 .unwrap_or(variant);
             unread.hgvsg |= hgvsg_rows.hold(tc) && hgvsg_wants_the_reference(described);
             unread.hgvsc |= hgvsc_rows.hold(tc)
-                && tc.is_some_and(|tc| hgvsc_wants_the_reference(variant, tc, resources));
+                && tc.is_some_and(|tc| {
+                    hgvsc_wants_the_reference(variant, tc, resources, transcripts)
+                });
         }
         resources.transcripts.note_unread_notations(chr, unread);
     }
@@ -4758,6 +4797,7 @@ fn hgvsc_wants_the_reference(
     variant: &InputVariant,
     tc: &TranscriptConsequence,
     resources: &AnnotationResources,
+    transcripts: &BatchTranscripts,
 ) -> bool {
     if tc.hgvsc.is_some() || variant.is_structural {
         return false;
@@ -4766,8 +4806,7 @@ fn hgvsc_wants_the_reference(
         return false;
     };
     let (start, end) = structural_variant_bounds(variant);
-    let moved = resources
-        .transcripts
+    let moved = transcripts
         .get(&variant.chr)
         .and_then(|index| index.origin_shift(transcript, start, end))
         .map(|length| one_turn_on(variant, length));
@@ -5137,6 +5176,7 @@ pub(crate) fn intergenic_shift(
 pub(crate) fn annotate_batch(
     batch: &mut Vec<InputVariant>,
     resources: &AnnotationResources,
+    transcripts: &BatchTranscripts,
     pool: &ThreadPool,
     use_parallel: bool,
     stats: &PipelineStats,
@@ -5160,8 +5200,9 @@ pub(crate) fn annotate_batch(
     // order and not as its threads reach them.
     let drawn: Mutex<Vec<(usize, String)>> = Mutex::default();
     let annotate_one = |index: usize, variant: &mut InputVariant| -> u64 {
-        let (csqs, events) =
-            crate::warnings::holding_events(|| annotate_one(variant, resources, &failure));
+        let (csqs, events) = crate::warnings::holding_events(|| {
+            annotate_one(variant, resources, transcripts, &failure)
+        });
         if !events.is_empty() {
             drawn
                 .lock()
@@ -5497,7 +5538,7 @@ fn lookup_predictions(
 /// own, because two implementations of one behaviour diverge.
 pub(crate) fn append_bnd_mate_consequences(
     variant: &mut InputVariant,
-    transcripts_by_chr: &LazyTranscriptIndexes,
+    transcripts_by_chr: &impl ChromosomeIndexes,
     config: &vep_effects::EffectsConfig,
     transcript_filter: Option<&FilterSet>,
 ) {
@@ -5589,10 +5630,11 @@ pub(crate) fn warm_and_annotate_batch(
     stats: &PipelineStats,
     stats_enabled: bool,
 ) -> anyhow::Result<()> {
-    prewarm_batch(batch, resources, pool)?;
+    let transcripts = prewarm_batch(batch, resources, pool)?;
     annotate_batch(
         batch,
         resources,
+        &transcripts,
         pool,
         use_parallel,
         stats,
@@ -7934,8 +7976,13 @@ mod tests {
             });
             let mut batch = parse_vcf_line(line, false).unwrap();
             let pool = build_thread_pool(1).unwrap();
-            prewarm_batch(&batch, &resources, &pool).unwrap();
-            annotate_one(&mut batch[0], &resources, &ReadFailure::default());
+            let transcripts = prewarm_batch(&batch, &resources, &pool).unwrap();
+            annotate_one(
+                &mut batch[0],
+                &resources,
+                &transcripts,
+                &ReadFailure::default(),
+            );
             let variant = batch.remove(0);
             assert_eq!(
                 variant.most_severe_consequence,
@@ -8403,7 +8450,12 @@ mod tests {
         batch.extend(parse_vcf_line("21\t1009\trs2\tT\tTGGC\t.\t.\t.", true).expect("parse"));
         batch.extend(parse_vcf_line("21\t1009\trs3\tT\tTGGG\t.\t.\t.", true).expect("parse"));
         for variant in batch.iter_mut() {
-            annotate_one(variant, &resources, &failure);
+            annotate_one(
+                variant,
+                &resources,
+                &resources.transcripts.snapshot_of_loaded(),
+                &failure,
+            );
         }
         assert!(marked(&batch[0]));
         assert!(!marked(&batch[1]));
@@ -8456,7 +8508,12 @@ mod tests {
             let mut batch = parse_vcf_line("21\t1009\trs1\tT\tTGGG\t.\t.\t.", true).expect("parse");
             batch.extend(parse_vcf_line("21\t1009\trs2\tT\tTGGG\t.\t.\t.", true).expect("parse"));
             for variant in batch.iter_mut() {
-                annotate_one(variant, &resources, &failure);
+                annotate_one(
+                    variant,
+                    &resources,
+                    &resources.transcripts.snapshot_of_loaded(),
+                    &failure,
+                );
             }
             apply_record_rules(&mut batch, None);
             batch
@@ -8548,7 +8605,12 @@ mod tests {
                 batch.extend(parse_vcf_line(line, true).expect("parse"));
             }
             for variant in batch.iter_mut() {
-                annotate_one(variant, models, &failure);
+                annotate_one(
+                    variant,
+                    models,
+                    &models.transcripts.snapshot_of_loaded(),
+                    &failure,
+                );
                 for tc in variant.transcript_consequences.iter_mut() {
                     tc.hgvsc = Some(format!("{}:c.10_11insGGG", tc.transcript_id()));
                 }
@@ -8766,7 +8828,12 @@ mod tests {
                 batch.extend(parse_vcf_line(line, true).expect("parse"));
             }
             for variant in batch.iter_mut() {
-                annotate_one(variant, models, &failure);
+                annotate_one(
+                    variant,
+                    models,
+                    &models.transcripts.snapshot_of_loaded(),
+                    &failure,
+                );
             }
             apply_record_rules(&mut batch, None);
             batch
@@ -8792,7 +8859,11 @@ mod tests {
             let mut resources = resources_over(Arc::new(LazyTranscriptIndexes::empty()));
             resources.effects_config = under_both_flags(&chromosome_1_alone);
             set(&mut resources);
-            note_notations_the_reference_lacks(batch, &resources);
+            note_notations_the_reference_lacks(
+                batch,
+                &resources,
+                &resources.transcripts.snapshot_of_loaded(),
+            );
             resources.transcripts.unread_notations()
         };
         let config = |set: fn(&mut FilterConfig)| {
@@ -8906,7 +8977,12 @@ mod tests {
         crate::individuals::add_reference_allele_row(&mut record);
         let over_models = models_with(None);
         for variant in record.iter_mut() {
-            annotate_one(variant, &over_models, &failure);
+            annotate_one(
+                variant,
+                &over_models,
+                &over_models.transcripts.snapshot_of_loaded(),
+                &failure,
+            );
         }
         apply_record_rules(&mut record, None);
         assert!(record[0].reference_allele_row && !record[1].reference_allele_row);
@@ -9329,16 +9405,31 @@ mod tests {
 
         let mut star = parse_vcf_line("21\t20000\tr_star\tA\t*\t.\t.\t.", true).expect("parse");
         assert!(star[0].no_allele);
-        annotate_one(&mut star[0], &resources, &failure);
+        annotate_one(
+            &mut star[0],
+            &resources,
+            &resources.transcripts.snapshot_of_loaded(),
+            &failure,
+        );
         assert_eq!(star[0].nearest, Some(vec!["ENSGCODING".to_string()]));
 
         let mut snv = parse_vcf_line("21\t20000\trs1\tA\tG\t.\t.\t.", true).expect("parse");
-        annotate_one(&mut snv[0], &resources, &failure);
+        annotate_one(
+            &mut snv[0],
+            &resources,
+            &resources.transcripts.snapshot_of_loaded(),
+            &failure,
+        );
         assert_eq!(snv[0].nearest, Some(vec!["ENSGCODING".to_string()]));
 
         resources.nearest = None;
         let mut plain = parse_vcf_line("21\t20000\trs1\tA\tG\t.\t.\t.", true).expect("parse");
-        annotate_one(&mut plain[0], &resources, &failure);
+        annotate_one(
+            &mut plain[0],
+            &resources,
+            &resources.transcripts.snapshot_of_loaded(),
+            &failure,
+        );
         assert_eq!(plain[0].nearest, None);
     }
 
@@ -9509,6 +9600,7 @@ mod tests {
         annotate_batch(
             &mut batch,
             &resources,
+            &resources.transcripts.snapshot_of_loaded(),
             &pool,
             false,
             &stats,
