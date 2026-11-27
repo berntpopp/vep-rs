@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Caches, reference FASTA and the cache tools
   - `vep-cache-builder --include-variations` writes four chromosomes' variation files at once, unchanged: half the wall time on GRCh38 chromosomes 21, 22, Y and MT, with twice the memory.
 
+### Fixed
+
+- HGVS, SPDI and identifiers
+  - An HGVS `dup` on a forward-strand transcript whose span ends past the 64-bit range is refused instead of read as an insertion at a wrapped position.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
