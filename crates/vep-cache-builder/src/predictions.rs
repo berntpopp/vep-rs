@@ -302,6 +302,16 @@ fn read_matrix_rows(
     mut matrix: impl FnMut(&[u8], &[u8], Vec<u8>),
 ) -> Result<()> {
     read_rows_up_to(path, 3, &[0, 1, 2], MAX_ROW_BYTES, |row| {
+        // The matrix is binary and the last column, so a raw tab in it would
+        // cut it short; such a row is refused rather than read.
+        if row.width() != 3 {
+            bail!(
+                "{} row {} has {} columns, the schema has 3",
+                path.display(),
+                row.number,
+                row.width()
+            );
+        }
         if let (Some(md5_id), Some(analysis_id)) = (row.value(0), row.value(1)) {
             if wanted(md5_id, analysis_id) {
                 if let Some(blob) = row.value(2) {
@@ -681,11 +691,11 @@ mod tests {
         assert!(rows[0].2 == matrix, "the matrix differs");
     }
 
-    /// A row of two columns, and a file that ends inside a row, after a value
-    /// or after a backslash, are refused naming the file and the row. A row of
-    /// four columns is read as its first three, as every table dump is.
+    /// A row of two columns or of four, and a file that ends inside a row,
+    /// after a value or after a backslash, are refused naming the file and
+    /// the row.
     #[test]
-    fn a_short_row_and_a_cut_file_are_refused_naming_the_row() {
+    fn a_row_of_another_width_and_a_cut_file_are_refused_naming_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let refusal = |dump: &[u8]| {
             let path = write_dump(dir.path(), "protein_function_predictions.txt", dump);
@@ -696,14 +706,15 @@ mod tests {
             refusal(b"1\t2\t\\0\n3\t4\n"),
             "<file> row 2 has 2 columns, the schema has 3"
         );
-        let wide = write_dump(
-            dir.path(),
-            "protein_function_predictions.txt",
-            b"1\t2\tab\tcd\n",
-        );
         assert_eq!(
-            matrix_rows(&wide).unwrap().0,
-            [(b"1".to_vec(), b"2".to_vec(), b"ab".to_vec())]
+            refusal(b"1\t2\tab\tcd\n"),
+            "<file> row 1 has 4 columns, the schema has 3"
+        );
+        // A raw tab inside a matrix makes a row wider than three columns,
+        // which the shared reader would read as its first three.
+        assert_eq!(
+            refusal(b"1\t2\tab\n3\t4\tc\td\te\n"),
+            "<file> row 2 has 5 columns, the schema has 3"
         );
         for cut in [
             &b"1\t2\tab\n3\t4\tcd"[..],

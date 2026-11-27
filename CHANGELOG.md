@@ -54,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vep-cache-builder --auto` passes over a `CHECKSUMS` line whose name is not one bare file name, so a mirror cannot place or delete a file outside the work directory.
   - `cargo install vep-cache-converter` no longer compiles Parquet, Arrow or mimalloc, and `cargo install vep-cache-builder` deflates BGZF through libdeflate, as the release binaries do.
   - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build.
-  - `vep-cache-builder` reads the SIFT and PolyPhen matrix dump with the reader of every other table dump, so a row with a column past the third is read as its first three.
+  - `vep-cache-builder` reads the SIFT and PolyPhen matrix dump through the reader of every other table dump, still refusing a row that is not three columns.
 - Documentation, test corpora and comparison tools
   - `vep-formats-compare` applies `merged_same_stable_id_collapse` to a row without `SOURCE` only where the rows carry `REFSEQ_MATCH`, so a run without `--refseq` or `--merged` stays red.
   - `hgvs_added_bases_left_at_the_span_end` in `vep-formats-compare` and `vep-plugin-pairs` reads a VCF or JSON row at its record's Location, so it sets aside those rows too.
