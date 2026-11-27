@@ -42,7 +42,7 @@ use noodles::csi::binning_index::index::header::Format;
 use noodles::csi::binning_index::BinningIndex;
 use tracing::{info, warn};
 use vep_builtins::binary_store::{
-    BinaryStoreStream, BinaryStoreWriter, ContentIdentity, StorePaths,
+    BinaryAnnotator, BinaryStoreStream, BinaryStoreWriter, ContentIdentity, StorePaths,
 };
 use vep_builtins::tabix::TabixConfig;
 use vep_builtins::PluginError;
@@ -119,6 +119,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_verify: bool,
     },
+    /// Check a binary annotation store against its table in full: the SHA256
+    /// of the whole .vpd and of the whole table, which a plugin's open checks
+    /// only by length and by their first and last MiB.
+    Verify {
+        /// The binary data file (.vpd); its index (.vpdi) lies beside it.
+        #[arg(long)]
+        store: String,
+
+        /// The table the store was converted from.
+        #[arg(long)]
+        table: String,
+    },
 }
 
 /// A failed run prints one line, `ERROR: [cache-converter] <message>`, on
@@ -174,6 +186,11 @@ fn run() -> Result<()> {
             cfg.alt_col = None;
             cfg.zero_based = zero_based;
             convert_plugin_data(&input, &output, &cfg, verify_all, no_verify)?;
+        }
+        Some(Commands::Verify { store, table }) => {
+            BinaryAnnotator::verify(Path::new(&store), Path::new(&table))
+                .map_err(|e| anyhow::anyhow!("{}", e.detail()))?;
+            info!(store, table, "the store answers for the table");
         }
         None => {
             let output_dir = cli
@@ -763,7 +780,11 @@ fn stream_table(
     Ok(TableRead {
         stream,
         spans,
-        source: ContentIdentity::new(sha256, length),
+        source: ContentIdentity::new(
+            sha256,
+            length,
+            ContentIdentity::sampled_of_file(path).with_context(read_failed)?,
+        ),
         rows,
     })
 }
@@ -1060,7 +1081,12 @@ fn read_tabix_records(path: &Path, cfg: &TabixConfig) -> Result<GroupedRecords> 
     let sha256 = hashed.digest_to_end().with_context(read_failed)?;
     let length = file.stream_position().with_context(read_failed)?;
 
-    Ok((header_names, grouped, ContentIdentity::new(sha256, length)))
+    let sampled = ContentIdentity::sampled_of_file(path).with_context(read_failed)?;
+    Ok((
+        header_names,
+        grouped,
+        ContentIdentity::new(sha256, length, sampled),
+    ))
 }
 
 /// Result of concordance verification.

@@ -8,8 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `vep-cache-converter verify` holds a `.vpd` store to the whole SHA256 of its data file and table, which an open no longer reads; version 5 indexes keep that check at open.
+
 ### Changed
 
+- A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.6 s, not 5.7 s, on a 7 GB store.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 

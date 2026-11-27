@@ -173,11 +173,26 @@ that rebuilds it. Beside a data file with no index, a refusal that names the
 conversion ends with `--no-verify`, the flag the conversion needs on such a
 file.
 
-The store's index also records the SHA256 and the length of the data file it
-was built from and of its own `.vpd` file. A plugin refuses a store whose data
-file differs from that record, as a data file replaced under the same name
-does. It refuses a store whose `.vpd` differs from it, as an index beside
-another store's data does.
+The store's index also records the length, the SHA256 and a sampled digest of
+the data file it was built from and of its own `.vpd` file. The sampled digest
+is the SHA256 of a file's first and last MiB. Every open compares the lengths
+and the sampled digests. A plugin refuses a store whose data file differs from
+that record, as a data file replaced under the same name does. It refuses a
+store whose `.vpd` differs from it, as an index beside another store's data
+does.
+
+An open reads only those two MiB of each file. A change that keeps a file's
+length and lies wholly between its first and last MiB is not seen by an open,
+and the plugin reads the store as it stands. The converter's check reads both
+files whole and refuses such a change by their SHA256:
+
+```bash
+vep-cache-converter verify --store <file>.vpd --table <data file>
+```
+
+Run it after copying or restoring a store, or whenever a data file may have
+been edited in place. A store whose index is of version 5, which records no
+sampled digest, is held to the whole files' SHA256 on every open.
 
 The index ends with the SHA256 of its own bytes. A plugin refuses a store whose
 index differs from that digest, as an index altered or cut short does. It also
@@ -189,9 +204,11 @@ data file is read through tabix, so the answer is the data file's either way.
 An `INFO` line names what each plugin reads: the store, with the data file's
 path and both SHA256 values, or the data file.
 
-The data file must stay beside its store: each open reads both whole, once, to
-check them. The time therefore grows with the two files' sizes: seconds for
-files of several gigabytes where both are in memory.
+The data file must stay beside its store: each open reads the first and last
+MiB of both to check them, which takes milliseconds whatever the files' sizes.
+The index itself is read whole for its own digest. `verify`, and an open of a
+version 5 index, read both files whole, which takes seconds for files of
+several gigabytes where both are in memory.
 
 ## How a row's cells are read
 
