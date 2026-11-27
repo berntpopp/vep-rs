@@ -1512,7 +1512,7 @@ fn the_collapse_class_accepts_a_transcript_row_the_candidate_alone_writes_on_an_
     );
 }
 
-/// The record of issue 35 on an Ensembl cache, no `--merged`: the CSQ format carries
+/// `chr13 60000000 A [CHR17:7675000[A` on an Ensembl cache, no `--merged`: the CSQ format carries
 /// SYMBOL_SOURCE and no SOURCE or REFSEQ_MATCH, so the candidate's mate rows inside TP53 stay
 /// unexpected under the collapse class as without it.
 #[test]
