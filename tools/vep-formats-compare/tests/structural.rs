@@ -770,7 +770,7 @@ fn a_mate_side_row_read_at_the_local_coordinate_is_set_aside_as_a_pair() {
 
 /// A mate spelled `CHR22` names no chromosome to the reference (StructuralVariationOverlap.pm
 /// :86-103), so it writes no mate row, and where the own end reaches no transcript it writes
-/// no CSQ at all, issue 26's `chr13 31613634 C C[CHR17:7675000[`. A candidate-only mate row of
+/// no CSQ at all, as for `chr13 31613634 C C[CHR17:7675000[`. A candidate-only mate row of
 /// a transcript on the mate's chromosome within 5,000 bases of the mate is the class, and the
 /// record's CSQ_present is left uncompared; a mate the reference resolves, a transcript
 /// farther from the mate stay differences.

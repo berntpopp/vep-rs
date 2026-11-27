@@ -647,7 +647,7 @@ mod tests {
             assert_eq!(lost(&perl, &rust, &cache()), [[""; 5]; 0]);
         }
 
-        /// Issue 26's `13 31613634 C C[CHR17:7675000[`: the own end reaches no transcript and
+        /// `13 31613634 C C[CHR17:7675000[`: the own end reaches no transcript and
         /// the mate name no chromosome, so the reference writes nothing at the Location; the
         /// scored engine's mate rows of a transcript within 5,000 bases of the mate are set
         /// aside, and one farther away, or a run whose cache holds no span, stays charged.
