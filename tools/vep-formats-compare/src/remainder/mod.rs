@@ -416,10 +416,7 @@ fn hand_over_outputs(
             masked(BREAKEND_MATE_LOCAL_READ) || masked(BND_OWN_CHROMOSOME_ROWS_LOST),
         );
         if let Some(input) = records_path.filter(|_| skipped || breakends) {
-            let read =
-                records_read_across(input, skipped, breakends, MAX_SV_SIZE).map_err(|error| {
-                    Error::comparator(format!("cannot read {}: {error}", input.display()))
-                })?;
+            let read = records_read_across(input, skipped, breakends, MAX_SV_SIZE)?;
             force_records.extend(read);
         }
     } else {
