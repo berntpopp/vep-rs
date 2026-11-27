@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Input formats and records
   - A `--vcf` or `--individual` run no longer splits a plain-`ACGT` record's INFO column to read `SVTYPE`, using 10 percent less CPU time on 50,000 1000 Genomes chr21 sites.
+  - The streaming coordinator parses only lines holding a bracket or `CHR2` for breakend mates, and `--check_existing` bisects its windows; wall time unchanged within noise on 50,000 chr21 sites, 16 threads.
 - Warnings and skipped variants
   - A run that skips many lines holds each numbered skip warning only for its own line and streams `--skipped_variants_file`, lowering peak memory 42 percent on 1,000,000 skipped synthetic records.
 - Output formats, columns and headers
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file.
   - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store.
 - Caches, reference FASTA and the cache tools
+  - Each batch loads only the transcript shards its sequence records reach, and chromosomes the input left are released: 24 SNVs on 24 chromosomes peak at 0.80 GB, not 8.27 GB.
   - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged.
   - `vep-cache-builder --include-variations` writes four chromosomes' variation files at once, unchanged: half the wall time on GRCh38 chromosomes 21, 22, Y and MT, with twice the memory.
