@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Documentation, test corpora and comparison tools
-  - `bnd_own_chromosome_rows_lost` in `vep-formats-compare` and `vep-sv-compare` sets aside the mate rows of a breakend whose `CHR`-spelled mate Ensembl VEP leaves without CSQ.
+  - `bnd_own_chromosome_rows_lost` in `vep-formats-compare` and `vep-sv-compare` sets aside the mate rows of a breakend whose `CHR`-spelled mate Ensembl VEP leaves without CSQ. (#178)
 
 ## [1.0.0] - 2026-11-24
 
