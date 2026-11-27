@@ -1988,13 +1988,8 @@ mod tests {
             .iter()
             .find(|r| r.variation_name == "rs2838519")
             .unwrap();
-        let columns: Vec<&str> = record
-            .frequencies
-            .iter()
-            .map(|(column, _)| column.as_str())
-            .collect();
         assert!(
-            !columns.contains(&"AFR") && !columns.contains(&"AMR"),
+            !record.frequencies.contains_key("AFR") && !record.frequencies.contains_key("AMR"),
             "{:?}",
             record.frequencies
         );
