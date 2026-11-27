@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged.
   - `vep-cache-builder --include-variations` writes four chromosomes' variation files at once, unchanged: half the wall time on GRCh38 chromosomes 21, 22, Y and MT, with twice the memory.
   - `vep-io`, `vep-effects`, `vep-cli` and `vep-cache-converter` drop dependencies their code never used: `noodles`, `tracing`, `indexmap`, `thiserror`, `csv` and `serde`.
+- Builds and CPU floors
+  - On Linux, a build from a checkout, `tools/` included, compiles for the target's generic CPU, as `cargo install` does, and runs on any machine; release archives keep their floors. (#181)
+  - On x86_64 Linux, `vep`, `vep-cache-builder` and `vep-cache-converter` built above the machine's CPU floor stop with one `ERROR:` line naming the floor, not an illegal-instruction fault. (#181)
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 - Documentation, test corpora and comparison tools
