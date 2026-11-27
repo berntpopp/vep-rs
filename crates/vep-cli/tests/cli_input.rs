@@ -534,7 +534,7 @@ fn format_is_detected_from_the_first_data_line() {
 }
 
 /// An input whose first data line is of no known shape, or that has no data
-/// line at all, is refused with Ensembl VEP's text (Parser.pm:150), and a
+/// line at all, is refused with Ensembl VEP's text (Parser.pm:151), and a
 /// pointer to `--format`, before any output is written.
 #[test]
 fn undetectable_input_is_refused() {
