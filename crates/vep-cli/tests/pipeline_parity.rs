@@ -638,7 +638,10 @@ fn pool_annotated_plugins_write_the_same_bytes_at_fork_1_and_16() {
             compared += 1;
         }
     }
-    assert!(compared >= 5, "{compared} LoFTEE or Downstream runs compared");
+    assert!(
+        compared >= 5,
+        "{compared} LoFTEE or Downstream runs compared"
+    );
 }
 
 /// Every writer strategy, at every buffer size, to a file and to standard
