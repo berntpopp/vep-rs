@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Caches, reference FASTA and the cache tools
   - `vep-cache-converter` refuses an `--output-dir` that is its `--json-dir` before writing anything; the conversion deleted the source's `info.json` and emptied its variation files.
 
+### Fixed
+
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-builder --auto` passes over a `CHECKSUMS` line whose name is not one bare file name, so a mirror cannot place or delete a file outside the work directory.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
