@@ -25,7 +25,9 @@
 //! The table is small and the same for every variant, so each chromosome of
 //! it is read once, the first time a batch reaches it, and held as the three
 //! cells and the span of each row; a variant is then matched against the rows
-//! whose span overlaps it, as the region query matches it.
+//! whose span overlaps it, as the region query matches it. A chromosome that
+//! cannot be read whole is read over each batch's variant spans instead, so a
+//! line that fails to read fails only the variants whose span reaches it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -174,8 +176,8 @@ pub struct LoeufPlugin {
     /// Annotation store over the constraint table, set by `init`.
     store: Option<Box<dyn AnnotationStore>>,
     /// The chromosomes of the table read so far, by the name a variant asks
-    /// for them under.
-    contigs: Mutex<HashMap<String, Arc<Contig>>>,
+    /// for them under; `None` for one that could not be read whole.
+    contigs: Mutex<HashMap<String, Option<Arc<Contig>>>>,
     layout: Option<Layout>,
     match_by: Option<MatchBy>,
     /// The run's assembly, which names a mitochondrial record's contig to the
@@ -255,22 +257,23 @@ impl LoeufPlugin {
     /// The chromosome a variant names `chr`, read on the first call for it:
     /// one region query from the first base to the last the index can address,
     /// so the rows are the ones every region query on the chromosome reads.
+    /// `None` when that read fails, which is kept, so the chromosome is not
+    /// read whole again.
     fn contig(
         &self,
         store: &dyn AnnotationStore,
         layout: Layout,
         chr: &str,
-    ) -> Result<Arc<Contig>, PluginError> {
-        let mut contigs = self.contigs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(contig) = contigs.get(chr) {
-            return Ok(Arc::clone(contig));
+    ) -> Option<Arc<Contig>> {
+        let contigs = || self.contigs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(contig) = contigs().get(chr) {
+            return contig.clone();
         }
-        let records = store
-            .query_batch(&[(chr, 1, u64::MAX)])?
-            .into_records_of(chr);
-        let contig = Arc::new(Contig::of(records, layout));
-        contigs.insert(chr.to_string(), Arc::clone(&contig));
-        Ok(contig)
+        let read = store
+            .query_batch(&[(chr, 1, u64::MAX)])
+            .ok()
+            .map(|batch| Arc::new(Contig::of(batch.into_records_of(chr), layout)));
+        contigs().entry(chr.to_string()).or_insert(read).clone()
     }
 }
 
@@ -398,11 +401,29 @@ impl BuiltinPlugin for LoeufPlugin {
             return Ok(None);
         };
         let mut contigs: HashMap<String, Arc<Contig>> = HashMap::new();
+        // The spans of the variants on a chromosome not read whole, queried as
+        // a batch's spans are, so a failing read fails only the variants that
+        // reach it.
+        let mut unread: BTreeMap<&str, Vec<(&str, u64, u64)>> = BTreeMap::new();
         for variant in variants.iter().filter(|v| !v.is_structural) {
             let chr = table_contig(variant, self.assembly);
-            if !contigs.contains_key(chr) {
-                contigs.insert(chr.to_string(), self.contig(store.as_ref(), layout, chr)?);
+            if contigs.contains_key(chr) {
+                continue;
             }
+            if !unread.contains_key(chr) {
+                if let Some(contig) = self.contig(store.as_ref(), layout, chr) {
+                    contigs.insert(chr.to_string(), contig);
+                    continue;
+                }
+            }
+            unread
+                .entry(chr)
+                .or_default()
+                .push((chr, variant.start, variant.end));
+        }
+        for (chr, regions) in unread {
+            let records = store.query_batch(&regions)?.into_records_of(chr);
+            contigs.insert(chr.to_string(), Arc::new(Contig::of(records, layout)));
         }
         if contigs.is_empty() {
             return Ok(None);
@@ -863,6 +884,60 @@ mod tests {
                     "{match_by}"
                 );
             }
+        }
+    }
+
+    /// `LOEUF.pm` `run` reads the rows over each variant alone, so a line past
+    /// the batch's variants that cannot be read, here one over the line limit,
+    /// fails none of them, in this batch and the next.
+    #[test]
+    fn a_table_unreadable_past_the_batch_still_answers_its_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let gene = |name: &str, id: &str, start: &str, end: &str, filler: &str| {
+            row(
+                78,
+                &[
+                    (0, name),
+                    (1, "ENST1"),
+                    (2, filler),
+                    (30, "1.0000e-01"),
+                    (64, id),
+                    (75, "21"),
+                    (76, start),
+                    (77, end),
+                ],
+            )
+        };
+        let overlong = "x".repeat(crate::tabix::MAX_LINE_BYTES);
+        let lines = [
+            row(
+                78,
+                &[
+                    (0, "#gene"),
+                    (1, "transcript"),
+                    (30, "oe_lof_upper"),
+                    (64, "gene_id"),
+                    (75, "chromosome"),
+                    (76, "start_position"),
+                    (77, "end_position"),
+                ],
+            ),
+            gene("A", "ENSG1", "1000", "5000", ""),
+            gene("FAR", "ENSG4", "20000", "30000", ""),
+            gene("LONG", "ENSG5", "45000000", "45001000", &overlong),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_tabix_fixture(
+            dir.path(),
+            "loeuf_dataset.tsv.gz",
+            &lines,
+            IndexSpec::standard().with_span_cols(76, 77, 78),
+        );
+        let plugin = plugin(&path, "gene");
+        for _batch in 0..2 {
+            let mut variants = vec![variant(4000, &[("ENST1", "ENSG1", MISSENSE)])];
+            plugin.run_batch(&mut variants).unwrap();
+            assert_eq!(loeuf_of(&variants, 0, 0), Some("1.0000e-01"));
         }
     }
 
