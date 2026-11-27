@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Caches, reference FASTA and the cache tools
   - Each batch loads only the transcript shards its sequence records reach, and chromosomes the input left are released: 24 SNVs on 24 chromosomes peak at 0.80 GB, not 8.27 GB.
-  - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
+  - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads. (#139)
 - Input formats and records
   - The streaming coordinator parses only lines holding a bracket or `CHR2` for breakend mates, and `--check_existing` bisects its windows; wall time unchanged within noise on 50,000 chr21 sites, 16 threads.
 - Dependencies and tooling
