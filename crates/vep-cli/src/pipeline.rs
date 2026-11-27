@@ -2495,7 +2495,6 @@ struct Staged {
     batch: ParsedBatch,
     skips: Vec<SkipReport>,
     prefetch: BatchPrefetch,
-    transcripts: Arc<BatchTranscripts>,
 }
 
 /// The prefetch stage: takes each batch from the reader, parses it on the pool
@@ -2558,7 +2557,6 @@ fn stage_batch(
             batch,
             skips,
             prefetch: BatchPrefetch::default(),
-            transcripts: Arc::default(),
         });
     }
     let transcripts = prewarm_chromosomes(&batch.variants, c.resources)?;
@@ -2587,7 +2585,8 @@ fn stage_batch(
         }
         None => true,
     };
-    let prefetch = fetch_batch(&batch.variants, c.resources, c.pool, variation_ahead)?;
+    let mut prefetch = fetch_batch(&batch.variants, c.resources, c.pool, variation_ahead)?;
+    prefetch.transcripts = transcripts;
     debug!(
         batch_size = batch.variants.len(),
         prefetch_ms = prefetch_start.elapsed().as_millis() as u64,
@@ -2597,7 +2596,6 @@ fn stage_batch(
         batch,
         skips,
         prefetch,
-        transcripts,
     })
 }
 
@@ -2651,8 +2649,8 @@ fn coordinate(
             mut batch,
             skips,
             mut prefetch,
-            transcripts,
         } = staged?;
+        let transcripts = Arc::clone(&prefetch.transcripts);
         if !skips.is_empty() {
             if !writer.caught_up() {
                 // The writer stopped; it reports why.
@@ -2677,7 +2675,6 @@ fn coordinate(
                 warnings = annotate_batch(
                     &mut batch.variants,
                     c.resources,
-                    &transcripts,
                     c.pool,
                     c.use_parallel,
                     c.stats,
@@ -3507,6 +3504,15 @@ fn chunk_record_end(units: &[Unit], offset: usize) -> usize {
         .unwrap_or(offset)
 }
 
+/// What a batch's tasks read beside their records: the batch's transcript
+/// indexes, and the record of a variation-file read failure, which the caller
+/// checks once the batch's tasks are done.
+#[derive(Clone, Copy)]
+struct BatchReads<'a> {
+    transcripts: &'a BatchTranscripts,
+    failure: &'a ReadFailure,
+}
+
 /// One fused task: annotates and filters `slice`, the whole records of `units`
 /// laid out from index `offset` of the batch's variants, applies the record
 /// rules, renders the units into a chunk reserved at `reserve` bytes and frees
@@ -3521,11 +3527,14 @@ fn fused_task(
     slice: &mut [InputVariant],
     offset: usize,
     text: &[u8],
-    transcripts: &BatchTranscripts,
     c: &Coordinator<'_>,
     reserve: usize,
-    failure: &ReadFailure,
+    reads: BatchReads<'_>,
 ) -> anyhow::Result<(Chunk, u64, Vec<String>)> {
+    let BatchReads {
+        transcripts,
+        failure,
+    } = reads;
     let ctx = c.write_ctx;
     let resources = c.resources;
     let filter = ctx.filters_active.then_some(ctx.filter_config);
@@ -3618,10 +3627,12 @@ fn annotate_render_batch(
                     slice,
                     offset,
                     text,
-                    transcripts,
                     c,
                     reserve,
-                    &failure,
+                    BatchReads {
+                        transcripts,
+                        failure: &failure,
+                    },
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -4239,10 +4250,12 @@ fn send_task_chunk(
                         &mut variants,
                         0,
                         &lines.text,
-                        transcripts,
                         c,
                         reserve,
-                        &failure,
+                        BatchReads {
+                            transcripts,
+                            failure: &failure,
+                        },
                     )?;
                     Ok((out, count, csqs, warnings))
                 });
@@ -4262,10 +4275,12 @@ fn send_task_chunk(
                 &mut variants,
                 offset,
                 &text,
-                transcripts,
                 c,
                 reserve,
-                &failure,
+                BatchReads {
+                    transcripts,
+                    failure: &failure,
+                },
             )
             .map(|(out, csqs, warnings)| (out, count, csqs, warnings));
             (result, None)
@@ -5749,7 +5764,6 @@ mod tests {
                 batch,
                 skips,
                 prefetch: BatchPrefetch::default(),
-                transcripts: Arc::default(),
             };
             assert!(staged_tx.send(Ok(staged)).is_ok());
             drop(staged_tx);

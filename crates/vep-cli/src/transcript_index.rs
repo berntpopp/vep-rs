@@ -658,7 +658,7 @@ pub struct LazyTranscriptIndexes {
     last_batch: Mutex<Vec<String>>,
     /// The span each shard's name states, beside `shards`; `None` for a name
     /// that states none.
-    spans: FxHashMap<String, Arc<[Option<(u64, u64)>]>>,
+    spans: FxHashMap<String, Arc<[ShardSpan]>>,
     upstream_distance: u64,
     downstream_distance: u64,
     transcript_set: TranscriptSet,
@@ -755,13 +755,19 @@ struct Held {
     whole_only: bool,
 }
 
+/// The span a shard's name states, `None` for a name that states none.
+type ShardSpan = Option<(u64, u64)>;
+
+/// An index with the shards it was built from, `None` for every shard.
+type HeldIndex = (Arc<TranscriptIndex>, Option<Arc<[usize]>>);
+
 /// One batch's transcript indexes: each chromosome its records reach, with the
 /// shards the index was built from (`None` for every shard). The batch keeps
 /// its indexes while it is annotated whatever the cache releases meanwhile
 /// ([`LazyTranscriptIndexes::release`]).
 #[derive(Default)]
 pub(crate) struct BatchTranscripts {
-    indexes: FxHashMap<String, (Arc<TranscriptIndex>, Option<Arc<[usize]>>)>,
+    indexes: FxHashMap<String, HeldIndex>,
 }
 
 impl BatchTranscripts {
@@ -1401,11 +1407,7 @@ impl LazyTranscriptIndexes {
     ///
     /// Like [`Self::prewarm`], the load parses on the global pool, so this runs
     /// outside the annotation pool's `install`, before a batch fans out.
-    fn hold(
-        &self,
-        chr: &str,
-        reach: &Reach,
-    ) -> anyhow::Result<Option<(Arc<TranscriptIndex>, Option<Arc<[usize]>>)>> {
+    fn hold(&self, chr: &str, reach: &Reach) -> anyhow::Result<Option<HeldIndex>> {
         let Some(slot) = self.slots.get(chr) else {
             return Ok(None);
         };

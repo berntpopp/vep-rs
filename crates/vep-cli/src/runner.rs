@@ -4306,6 +4306,8 @@ pub(crate) struct BatchPrefetch {
     svs: Option<sv_source::Prefetch>,
     plugins: Option<vep_builtins::PluginPrefetch>,
     custom: Option<custom::CustomPrefetch>,
+    /// The batch's transcript indexes ([`prewarm_chromosomes`]).
+    pub(crate) transcripts: Arc<BatchTranscripts>,
 }
 
 /// Reads ahead a batch's sources in parallel on `pool`, the pool `--fork`
@@ -4344,6 +4346,7 @@ pub(crate) fn fetch_batch(
         svs: spans?,
         plugins: plugin_prefetch,
         custom: custom_prefetch,
+        transcripts: Arc::default(),
     })
 }
 
@@ -5176,7 +5179,6 @@ pub(crate) fn intergenic_shift(
 pub(crate) fn annotate_batch(
     batch: &mut Vec<InputVariant>,
     resources: &AnnotationResources,
-    transcripts: &BatchTranscripts,
     pool: &ThreadPool,
     use_parallel: bool,
     stats: &PipelineStats,
@@ -5188,8 +5190,10 @@ pub(crate) fn annotate_batch(
     let BatchPrefetch {
         plugins: plugin_prefetch,
         custom: custom_prefetch,
+        transcripts,
         ..
     } = prefetch;
+    let transcripts: &BatchTranscripts = &transcripts;
     // The events the plugins and the sources raise over the batch, held on the
     // thread that runs each pass.
     let mut held: Vec<Held> = Vec::new();
@@ -5634,12 +5638,14 @@ pub(crate) fn warm_and_annotate_batch(
     annotate_batch(
         batch,
         resources,
-        &transcripts,
         pool,
         use_parallel,
         stats,
         stats_enabled,
-        BatchPrefetch::default(),
+        BatchPrefetch {
+            transcripts,
+            ..BatchPrefetch::default()
+        },
     )
     .map(drop)
 }
@@ -9600,12 +9606,14 @@ mod tests {
         annotate_batch(
             &mut batch,
             &resources,
-            &resources.transcripts.snapshot_of_loaded(),
             &pool,
             false,
             &stats,
             true,
-            BatchPrefetch::default(),
+            BatchPrefetch {
+                transcripts: Arc::new(resources.transcripts.snapshot_of_loaded()),
+                ..BatchPrefetch::default()
+            },
         )
         .expect("no variation window is read");
         assert!(batch[0].most_severe_consequence.is_some());
