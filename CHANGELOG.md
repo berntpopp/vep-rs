@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Plugins
+  - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
