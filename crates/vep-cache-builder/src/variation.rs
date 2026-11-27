@@ -1550,11 +1550,11 @@ impl ThousandGenomes {
                     column.push(format!("{cache_allele}:{}", perl_g4(*frequency)));
                 }
             }
-            if chromosomes > 0 {
-                columns[0].push(format!(
-                    "{cache_allele}:{}",
-                    perl_g4(count / chromosomes as f64)
-                ));
+            // No chromosome, or a count past `f64`'s range, gives no whole-panel
+            // frequency, which `perl_g4` could not print.
+            let panel = count / chromosomes as f64;
+            if panel.is_finite() {
+                columns[0].push(format!("{cache_allele}:{}", perl_g4(panel)));
             }
         }
         for (column, entries) in THOUSAND_GENOMES_COLUMNS.iter().zip(columns) {
@@ -1995,6 +1995,32 @@ mod tests {
             .collect();
         assert!(
             !columns.contains(&"AFR") && !columns.contains(&"AMR"),
+            "{:?}",
+            record.frequencies
+        );
+
+        // A finite frequency whose chromosome count overflows writes its own
+        // column and no whole-panel `AF`.
+        let huge = write_vcf(
+            dir.path(),
+            "1000GENOMES-huge.vcf",
+            "21\t44195140\trs2838519\tG\tA\t.\t.\tdbSNP_156;TSA=SNV;E_Freq;E_1000G;AFR=1e306;AMR=0.379;EAS=0.4534;EUR=0.6024;SAS=0.5583\n",
+        );
+        let inputs = GenomeWideInputs {
+            frequencies: Some(huge),
+            ..Default::default()
+        };
+        let records = collect(&germline, &inputs, None);
+        let record = records
+            .iter()
+            .find(|r| r.variation_name == "rs2838519")
+            .unwrap();
+        assert_eq!(
+            record.frequencies.get("AFR").map(String::as_str),
+            Some("A:1e+306")
+        );
+        assert!(
+            !record.frequencies.contains_key("AF"),
             "{:?}",
             record.frequencies
         );
