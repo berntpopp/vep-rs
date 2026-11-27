@@ -62,8 +62,10 @@
 //! holds them to its SHA256 too, as every open holds a version 5 index. A
 //! change of the same length between the index's first and last MiB is seen
 //! by `verify` alone. An index naming one chromosome
-//! twice, or holding a chromosome's positions out of ascending order, is
-//! refused naming the chromosome.
+//! twice is refused naming the chromosome, and one holding a chromosome's
+//! positions out of ascending order is refused by `verify` and by an open of
+//! a version 5 index; an open of a version 6 index trusts the writer's order
+//! check and its fingerprint, and its queries stay in bounds on any order.
 //!
 //! A store of any index version but the current one and version 5 is refused
 //! with the reconversion named, a later version as an earlier one: version 1
@@ -795,7 +797,15 @@ impl BinaryAnnotator {
 
             let entries_at = cursor.position() as usize;
             let mut previous: Option<u64> = None;
-            for _ in 0..pos_count {
+            // An open of a version 6 index trusts its fingerprint for the
+            // order the writer checked; `verify` and version 5 walk it.
+            let walked = if whole || version == UNSAMPLED_INDEX_VERSION {
+                pos_count
+            } else {
+                cursor.set_position((entries_at + pos_count * POSITION_ENTRY_BYTES) as u64);
+                0
+            };
+            for _ in 0..walked {
                 let position = read_u64(&mut cursor)?;
                 cursor.set_position(cursor.position() + (POSITION_ENTRY_BYTES - 8) as u64);
                 // A query finds a chromosome's entries by binary search.
@@ -1007,7 +1017,11 @@ impl BinaryAnnotator {
             |entry: &[u8; POSITION_ENTRY_BYTES]| u64::from_le_bytes(entry[..8].try_into().unwrap());
         let reach = start.saturating_sub(chr_index.longest_span);
         let lo = entries.partition_point(|entry| position(entry) < reach);
-        let hi = entries.partition_point(|entry| position(entry) <= end);
+        // Entries out of order, which only `verify` refuses, can place `hi`
+        // below `lo`; the slice stays in bounds, the rows found are its own.
+        let hi = entries
+            .partition_point(|entry| position(entry) <= end)
+            .max(lo);
 
         let mut records = Vec::new();
         for entry in &entries[lo..hi] {
@@ -4139,7 +4153,7 @@ mod tests {
     /// bytes are built by hand and sealed, and the same bytes holding one
     /// entry in order open.
     #[test]
-    fn an_index_naming_a_chromosome_twice_or_out_of_order_is_refused() {
+    fn an_index_naming_a_chromosome_twice_or_out_of_order_is_refused_by_its_check() {
         let dir = tempfile::tempdir().unwrap();
         let vpd_path = dir.path().join("table.vpd");
         let vpdi_path = dir.path().join("table.vpdi");
@@ -4192,16 +4206,28 @@ mod tests {
             ]),
             format!("plugin initialization failed: index names chromosome 21 twice; {RECONVERT}")
         );
+        // An open of a version 6 index trusts its fingerprint and does not
+        // walk the entries, so a disordered one opens and answers without a
+        // panic, whatever rows it finds; `verify` walks them and refuses it.
         for (positions, follows) in [
             (&[200u64, 100][..], "100 follows 200"),
             (&[100, 200, 200], "200 follows 200"),
+            (&[300, 200, 100], "200 follows 300"),
         ] {
+            let opened = opened(&[chromosome("21", positions)]);
+            assert!(opened.starts_with("opened, "), "{positions:?}: {opened}");
+            let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
+            for (start, end) in [(1, 1000), (150, 150), (250, 90), (0, u64::MAX)] {
+                let _ = store.query("21", start, end);
+            }
             assert_eq!(
-                opened(&[chromosome("21", positions)]),
-                format!(
+                BinaryAnnotator::verify(&vpd_path, &config.file_path)
+                    .err()
+                    .map(|e| e.to_string()),
+                Some(format!(
                     "plugin initialization failed: index positions of chromosome 21 do not \
                      ascend: {follows}; {RECONVERT}"
-                )
+                ))
             );
         }
     }
