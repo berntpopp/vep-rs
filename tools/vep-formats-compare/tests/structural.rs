@@ -1239,3 +1239,66 @@ fn the_classes_that_read_across_records_hand_over_only_the_groups_they_touch() {
         )
     );
 }
+
+/// A breakend whose ALT holds no bracket, `<BND>` with INFO/CHR2 and END2, writes bracket
+/// mate rows all the same, so the stream hands it over with its neighbours: the single
+/// breakend at its coordinate, whose own-end row the reference kept, keeps the candidate's
+/// own-end row of the `<BND>` record a difference, as on the whole outputs.
+#[test]
+fn a_symbolic_breakend_hands_over_the_records_beside_it() {
+    let directory = scratch("structural-symbolic-breakend");
+    let records = [
+        "21\t100000\tdot\tN\tN.\t.\t.\tSVTYPE=BND",
+        "21\t100000\tsym\tN\t<BND>\t.\t.\tSVTYPE=BND;CHR2=22;END2=5000000",
+    ];
+    let input = structural_input(&directory.join("in.vcf"), &records);
+    let cache = breakend_cache(&directory.join("cache"));
+    let header = "##fileformat=VCFv4.2\n##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from Ensembl VEP. \
+                  Format: Allele|Consequence|Feature_type|Feature\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+    let dot = format!(
+        "{};CSQ=N.|upstream_gene_variant|Transcript|ENST21_FAR\n",
+        records[0]
+    );
+    let mate = "N[22:5000000[|upstream_gene_variant|Transcript|ENST22";
+    let own = "N.|upstream_gene_variant|Transcript|ENST21";
+    let expected = directory.join("expected.vcf");
+    let actual = directory.join("actual.vcf");
+    std::fs::write(
+        &expected,
+        format!("{header}{dot}{};CSQ={mate}\n", records[1]),
+    )
+    .expect("the reference is written");
+    std::fs::write(
+        &actual,
+        format!("{header}{dot}{};CSQ={mate},{own}\n", records[1]),
+    )
+    .expect("the candidate is written");
+    let mut seen = Vec::new();
+    for whole in [true, false] {
+        let report = directory.join(format!("report.{whole}.json"));
+        let ran = run(
+            &[
+                "--format",
+                "vcf",
+                "--expected",
+                path_text(&expected),
+                "--actual",
+                path_text(&actual),
+                "--input",
+                path_text(&input),
+                "--json-cache",
+                path_text(&cache),
+                "--masks",
+                OWN_ROWS,
+                "--report",
+                path_text(&report),
+            ],
+            whole,
+        );
+        seen.push((std::fs::read(&report).ok(), ran.out, ran.code));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the streamed comparison against the whole one"
+    );
+}

@@ -34,6 +34,8 @@ use crate::shared::gvcf_site_rows;
 use crate::shared::is_structural_allele;
 use crate::shared::perl_fields;
 use crate::shared::perl_split;
+use crate::stream::lines::lines;
+use crate::stream::source::{Buffers, Source, BLOCK};
 use indexmap::IndexMap;
 use number::minus;
 use number::plus;
@@ -670,48 +672,71 @@ fn vcf_variant(line: &str) -> Option<VcfVariant> {
     })
 }
 
-/// The ordinals of the input's data lines, counted from 0 as the stream counts them
-/// (`stream::Plan::force_records`), whose groups the classes that read across records must
-/// see: a record the reference may skip (`perl_skip_route`) under `reference_skipped_record`,
-/// a bracket breakend under `breakend_mate_local_read` or `bnd_own_chromosome_rows_lost`,
-/// and every record whose span lies within two bases of one of those, whose rows those
-/// classes read beside it (the rivals at a start of `skipped_record_rows`, the tuples at a
-/// Location of the two breakend classes). The rest of a file's groups are touched by none
-/// of them.
+/// Each data line of the input with its ordinal, counted from 0 as the stream counts them
+/// (`stream::Plan::force_records`): the lines the stream's own blocks cut, every line that
+/// does not open with `#`, read once without holding the file.
+fn each_input_record(input: &Path, mut each: impl FnMut(u64, &str)) -> crate::error::Result<()> {
+    let source = Source::open(input)?;
+    let buffers = Buffers::new(BLOCK);
+    let mut blocks = source.blocks(&buffers)?;
+    let mut ordinal = 0u64;
+    while let Some(block) = blocks.next().map_err(|detail| source.failed(&detail))? {
+        let bytes = block.bytes();
+        for line in lines(bytes) {
+            let line = &bytes[line];
+            if line.first() != Some(&b'#') {
+                each(ordinal, &String::from_utf8_lossy(line));
+                ordinal += 1;
+            }
+        }
+        buffers.give(block.into_buffer());
+    }
+    Ok(())
+}
+
+/// The chromosome of a record and the lowest and highest coordinate its rows can name.
+fn record_reach(v: &VcfVariant) -> (String, Int, Int) {
+    let (_chrom, start, end) = record_location(v);
+    let (mut lo, mut hi) = (start.min(end).min(v.pos), start.max(end).max(v.pos));
+    for (_allele, start, end) in site_rows(v) {
+        (lo, hi) = (lo.min(start.min(end)), hi.max(start.max(end)));
+    }
+    (record_chromosome(v).to_string(), lo, hi)
+}
+
+/// The ordinals of the input's data lines whose groups the classes that read across records
+/// must see: a record the reference may skip (`perl_skip_route`) under
+/// `reference_skipped_record`, a breakend (a bracket, `<BND>`, a single breakend, or
+/// `SVTYPE=BND`, whose rows carry bracket mates) under `breakend_mate_local_read` or
+/// `bnd_own_chromosome_rows_lost`, and every record whose span lies within two bases of one
+/// of those, whose rows those classes read beside it (the rivals at a start of
+/// `skipped_record_rows`, the tuples at a Location of the two breakend classes). The rest
+/// of a file's groups are touched by none of them. The input is read twice, the second time
+/// only where it holds such a record.
 pub fn records_read_across(
     input: &Path,
     skipped: bool,
     breakends: bool,
     max_sv_size: i64,
-) -> std::io::Result<Vec<u64>> {
-    let text = vcf_text(input)?;
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    // (ordinal, chromosome, low, high) of every record read, and the seeds among them.
-    let mut spans: Vec<(u64, String, Int, Int)> = Vec::new();
+) -> crate::error::Result<Vec<u64>> {
     let mut seeds: IndexMap<String, Vec<(Int, Int)>> = IndexMap::new();
-    let data = lines.into_iter().filter(|line| !line.starts_with('#'));
-    for (ordinal, line) in (0u64..).zip(data) {
+    each_input_record(input, |_, line| {
         let Some(v) = vcf_variant(line) else {
-            continue;
+            return;
         };
-        let (_chrom, start, end) = record_location(&v);
-        let (mut lo, mut hi) = (start.min(end).min(v.pos), start.max(end).max(v.pos));
-        for (_allele, start, end) in site_rows(&v) {
-            (lo, hi) = (lo.min(start.min(end)), hi.max(start.max(end)));
-        }
-        let chrom = record_chromosome(&v).to_string();
-        let seed = (skipped && perl_skip_route(&v, max_sv_size).is_some())
-            || (breakends && v.alt.contains(['[', ']']));
-        if seed {
+        let breakend = v.variant_type == "BND"
+            || v.alt.contains(['[', ']'])
+            || v.info.split(';').any(|item| item == "SVTYPE=BND");
+        if (skipped && perl_skip_route(&v, max_sv_size).is_some()) || (breakends && breakend) {
+            let (chrom, lo, hi) = record_reach(&v);
             seeds
-                .entry(chrom.clone())
+                .entry(chrom)
                 .or_default()
                 .push((minus(lo, 2), plus(hi, 2)));
         }
-        spans.push((ordinal, chrom, lo, hi));
+    })?;
+    if seeds.is_empty() {
+        return Ok(Vec::new());
     }
     // The seeds' spans merged per chromosome, so that one search finds a record's.
     for merged in seeds.values_mut() {
@@ -725,16 +750,21 @@ pub fn records_read_across(
         }
         *merged = joined;
     }
-    Ok(spans
-        .into_iter()
-        .filter(|(_, chrom, lo, hi)| {
-            seeds.get(chrom).is_some_and(|merged| {
-                let at = merged.partition_point(|span| span.1 < *lo);
-                merged.get(at).is_some_and(|span| span.0 <= *hi)
-            })
-        })
-        .map(|(ordinal, ..)| ordinal)
-        .collect())
+    let mut read = Vec::new();
+    each_input_record(input, |ordinal, line| {
+        let Some(v) = vcf_variant(line) else {
+            return;
+        };
+        let (chrom, lo, hi) = record_reach(&v);
+        let beside = seeds.get(&chrom).is_some_and(|merged| {
+            let at = merged.partition_point(|span| span.1 < lo);
+            merged.get(at).is_some_and(|span| span.0 <= hi)
+        });
+        if beside {
+            read.push(ordinal);
+        }
+    })?;
+    Ok(read)
 }
 
 /// A transcript's `stable_id` as a key of the cache's views: a text, or a number by its

@@ -127,8 +127,9 @@ comparison compares them whole as well where the reference is refused, where a t
 or a tab candidate's column line follows a data line, where a row of either side holds a line
 end, and where a row of a Parquet side opens with `#`.
 In the VCF and JSON formats those three classes hand over the groups of the input records
-they can touch and stream the rest: a record on a skip route, a bracket breakend, and every
-record whose span lies within two bases of one of those.
+they can touch and stream the rest: a record on a skip route, a breakend (a bracket, `<BND>`,
+a single breakend or `SVTYPE=BND`), and every record whose span lies within two bases of one
+of those.
 `VEP_FORMATS_COMPARE_WHOLE=1` compares the whole outputs in every format. Both paths write the
 same report, the same standard output and the same exit code, but for the one input **Bounds**
 names.

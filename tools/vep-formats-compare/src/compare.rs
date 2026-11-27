@@ -1225,15 +1225,18 @@ pub fn compare_entries<'a>(
     // A record the reference wrote no row for whose every candidate row is a lost row of
     // `bnd_own_chromosome_rows_lost`: the reference's VCF line carries no CSQ at all.
     let lost = |key: &str| own_rows.rows.contains(key) || mate_rows.rows.contains(key);
+    // The records with a reference row, or a candidate row the class keeps, in one pass.
+    let written: HashSet<i64> = expected
+        .iter()
+        .chain(actual.iter().filter(|a| !lost(&a.key)))
+        .filter(|e| !record_key(&e.key))
+        .filter_map(|e| e.record)
+        .collect();
     let rows_lost_whole: HashSet<i64> = mate_rows
         .records
         .iter()
         .copied()
-        .filter(|record| {
-            let of_record = |e: &&Entry| e.record == Some(*record) && !record_key(&e.key);
-            !expected.iter().any(|e| of_record(&e))
-                && actual.iter().filter(of_record).all(|a| lost(&a.key))
-        })
+        .filter(|record| !written.contains(record))
         .collect();
     let mut stale: Vec<String> = Vec::new();
     // For each manifest item that states `rows_alike`: the rows of its key that carry its
