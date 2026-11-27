@@ -1002,7 +1002,8 @@ pub(crate) fn tabix_contig_order(
 }
 
 /// Warms transcript indexes ahead of the input on one helper thread, in the
-/// order the reader asks: the chromosome the reader has just reached and, when
+/// order the reader asks: the chromosome the reader has read [`DENSE_RECORDS`]
+/// records of in a row and, when
 /// the input's index gives the contig order, the ones after it as far as
 /// `--prewarm_ahead` says (one by default; under `all` the whole order is
 /// queued as the reader starts). One load at a time keeps the parse's
@@ -1052,7 +1053,8 @@ impl<'env> Prewarmer<'env> {
         prewarmer
     }
 
-    /// The reader has reached the input chromosome `input_chr`: it is warmed,
+    /// The reader has read [`DENSE_RECORDS`] records of the input chromosome
+    /// `input_chr` in a row: it is warmed whole,
     /// then the chromosomes after it in the index order, as many as the policy
     /// names (none under `all`, whose order was queued whole at the start).
     fn reached(&mut self, input_chr: &str) {

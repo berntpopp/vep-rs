@@ -1667,9 +1667,9 @@ pub(crate) fn load_transcripts_in_set_with(
 /// keys [`load_transcripts_in_set_with`] keeps.
 #[derive(Clone, Copy)]
 pub(crate) struct ShardOptions<'a> {
-    pub set: Option<&'a TranscriptSet>,
-    pub keep_exon_ids: bool,
-    pub keep_predictions: bool,
+    pub(crate) set: Option<&'a TranscriptSet>,
+    pub(crate) keep_exon_ids: bool,
+    pub(crate) keep_predictions: bool,
 }
 
 /// One shard's transcripts as [`parse_shards`] reads them, before the
@@ -1678,7 +1678,7 @@ pub(crate) struct ShardOptions<'a> {
 pub(crate) struct ParsedShard {
     transcripts: Vec<Transcript>,
     tally: GencodeTally,
-    pub lowest_start: Option<i64>,
+    pub(crate) lowest_start: Option<i64>,
 }
 
 /// Parses `shards` in parallel on the global pool, each checked against
