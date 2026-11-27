@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Library crates
-  - The library's `Annotator` sets each variant's `display_consequence`, as the `vep` binary does, instead of leaving it `None`.
+  - The library's `Annotator` sets each variant's `display_consequence`, as the `vep` binary does, instead of leaving it `None`. (#146)
 
 ## [1.0.0] - 2026-11-24
 
