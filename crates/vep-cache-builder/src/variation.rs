@@ -1475,7 +1475,13 @@ impl ThousandGenomes {
                 let mut entry = [f64::NAN; 5];
                 for (slot, population_values) in entry.iter_mut().zip(&values) {
                     if let Some(value) = population_values.get(index) {
-                        *slot = value.parse().unwrap_or(f64::NAN);
+                        // `perl_g4` prints finite numbers alone, so `inf` and an
+                        // overflow are read as absent.
+                        *slot = value
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .unwrap_or(f64::NAN);
                     }
                 }
                 record_alleles.push(entry);
@@ -1965,6 +1971,33 @@ mod tests {
         );
         assert!(frequencies("rs9").is_empty());
         assert!(frequencies("COSV1").is_empty());
+
+        // A frequency that is not finite, `inf` or one past `f64`'s range, is
+        // read as absent, as text that is not a number is.
+        let infinite = write_vcf(
+            dir.path(),
+            "1000GENOMES-infinite.vcf",
+            "21\t44195140\trs2838519\tG\tA\t.\t.\tdbSNP_156;TSA=SNV;E_Freq;E_1000G;AFR=inf;AMR=1e309;EAS=0.4534;EUR=0.6024;SAS=0.5583\n",
+        );
+        let inputs = GenomeWideInputs {
+            frequencies: Some(infinite),
+            ..Default::default()
+        };
+        let records = collect(&germline, &inputs, None);
+        let record = records
+            .iter()
+            .find(|r| r.variation_name == "rs2838519")
+            .unwrap();
+        let columns: Vec<&str> = record
+            .frequencies
+            .iter()
+            .map(|(column, _)| column.as_str())
+            .collect();
+        assert!(
+            !columns.contains(&"AFR") && !columns.contains(&"AMR"),
+            "{:?}",
+            record.frequencies
+        );
     }
 
     /// A frequency VCF allele matches a variant's allele through the minimised

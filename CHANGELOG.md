@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vep-io`, `vep-effects`, `vep-cli` and `vep-cache-converter` drop dependencies their code never used: `noodles`, `tracing`, `indexmap`, `thiserror`, `csv` and `serde`.
   - `cargo install vep-cache-converter` no longer compiles Parquet, Arrow or mimalloc, and `cargo install vep-cache-builder` deflates BGZF through libdeflate, as the release binaries do.
 
+### Fixed
+
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
