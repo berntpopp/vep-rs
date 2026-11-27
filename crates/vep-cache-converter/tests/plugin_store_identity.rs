@@ -711,3 +711,43 @@ fn a_position_past_the_last_one_the_index_holds_is_no_probe() {
         assert!(rows_at(last + 1).is_empty(), "{name}");
     }
 }
+
+/// `verify` holds a store to the whole table and data file: a fresh store
+/// passes and exits 0, and after the table is replaced at the same length it
+/// exits 1 on the one error line naming the table that differs.
+#[test]
+fn verify_checks_a_store_against_its_whole_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = write_table(dir.path(), "cov.tsv.gz", 13826645, "2.0000e+00");
+    let store = convert(&table);
+    let verify = || {
+        Command::new(env!("CARGO_BIN_EXE_vep-cache-converter"))
+            .arg("verify")
+            .arg("--store")
+            .arg(&store)
+            .arg("--table")
+            .arg(&table)
+            .output()
+            .unwrap()
+    };
+    let passed = verify();
+    assert!(
+        passed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&passed.stderr)
+    );
+
+    let before = std::fs::metadata(&table).unwrap().len();
+    write_table(dir.path(), "cov.tsv.gz", 13826645, "9.0000e+00");
+    assert_eq!(std::fs::metadata(&table).unwrap().len(), before);
+    let refused = verify();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with(&format!(
+            "ERROR: [cache-converter] store source differs: the table {} has SHA256 ",
+            table.display()
+        )),
+        "{stderr}"
+    );
+}

@@ -8,10 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-converter verify` holds a `.vpd` store to the whole SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep that check at open.
+- Library crates
+  - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once.
+
 ### Changed
 
+- Input formats and records
+  - A `--vcf` or `--individual` run no longer splits a plain-`ACGT` record's INFO column to read `SVTYPE`, using 10 percent less CPU time on 50,000 1000 Genomes chr21 sites.
+- Warnings and skipped variants
+  - A run that skips many lines holds each numbered skip warning only for its own line and streams `--skipped_variants_file`, lowering peak memory 42 percent on 1,000,000 skipped synthetic records.
+- Output formats, columns and headers
+  - The `--vcf` writer builds each `CSQ` entry in one buffer and `--json` builds each object once: 5 to 8 percent less CPU time on 50,000 1000 Genomes chr21 sites.
+- Command line, configuration and errors
+  - The refusal of an input whose format cannot be detected, a header-only VCF among them, names `--format`, and `--format vcf` for a VCF with no records.
+- Plugins
+  - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0.
+  - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads.
+  - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads.
+  - Tabix tables indexed on their start column alone (`gnomADc`, `CADD`, `SpliceAI` and others) read only each batch's own windows, side by side: 56 percent less wall time for `gnomADc` on ClinVar chr21, 16 threads.
+  - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file.
+  - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store.
+- Caches, reference FASTA and the cache tools
+  - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
+  - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged.
+  - `vep-cache-builder --include-variations` writes four chromosomes' variation files at once, unchanged: half the wall time on GRCh38 chromosomes 21, 22, Y and MT, with twice the memory.
+  - `vep-io`, `vep-effects`, `vep-cli` and `vep-cache-converter` drop dependencies their code never used: `noodles`, `tracing`, `indexmap`, `thiserror`, `csv` and `serde`.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
+- Documentation, test corpora and comparison tools
+  - `vep-formats-compare` streams a VCF or JSON comparison under the cross-record breakend and skipped-record classes, handing over only their records: ClinVar chr21 peak RSS 10.9 GB to 2.9 GB.
+
+### Fixed
+
+- HGVS, SPDI and identifiers
+  - An HGVS `dup` on a forward-strand transcript whose span ends past the 64-bit range is refused instead of read as an insertion at a wrapped position.
+- Transcript attributes, predictions and consequences
+  - `Amino_acids` translates a codon holding a byte outside the IUPAC alphabet as `X`, as BioPerl and the consequence terms read it, instead of as `N`.
+- Output formats, columns and headers
+  - A `--output_format parquet` run that fails removes its temporary directory, since a dropped `ParquetDirectoryWriter` now waits for its encoder thread instead of leaving it writing parts.
+- Library crates
+  - The library's `Annotator` sets each variant's `display_consequence`, as the `vep` binary does, instead of leaving it `None`.
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-converter` refuses an `--output-dir` that is its `--json-dir` before writing anything; the conversion deleted the source's `info.json` and emptied its variation files.
+  - `vep-cache-builder --auto` passes over a `CHECKSUMS` line whose name is not one bare file name, so a mirror cannot place or delete a file outside the work directory.
+  - `cargo install vep-cache-converter` no longer compiles Parquet, Arrow or mimalloc, and `cargo install vep-cache-builder` deflates BGZF through libdeflate, as the release binaries do.
+  - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build.
+  - `vep-cache-builder` reads the SIFT and PolyPhen matrix dump through the reader of every other table dump, still refusing a row that is not three columns.
+- Documentation, test corpora and comparison tools
+  - `vep-formats-compare` applies `merged_same_stable_id_collapse` to a row without `SOURCE` only where the rows carry `REFSEQ_MATCH`, so a run without `--refseq` or `--merged` stays red.
+  - `hgvs_added_bases_left_at_the_span_end` in `vep-formats-compare` and `vep-plugin-pairs` reads a VCF or JSON row at its record's Location, so it sets aside those rows too.
+  - `hgvs_shift_shared_across_alleles` in `vep-formats-compare` and `vep-plugin-pairs` takes a later in-frame insertion allele's `Codons` and `Amino_acids` as Ensembl VEP reads them at the moved pair.
+  - `bnd_own_chromosome_rows_lost` in `vep-formats-compare` and `vep-sv-compare` sets aside the mate rows of a breakend whose `CHR`-spelled mate Ensembl VEP leaves without CSQ.
 
 ## [1.0.0] - 2026-11-24
 

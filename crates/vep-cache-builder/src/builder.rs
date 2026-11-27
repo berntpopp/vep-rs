@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -32,9 +33,11 @@ use crate::translation_row::{coding_records, RowUse};
 /// Region size for binning transcripts (1 Mb).
 pub(crate) const REGION_SIZE: u64 = 1_000_000;
 
-/// First 1-based position of the 1 Mb region containing `pos`.
+/// First 1-based position of the 1 Mb region containing `pos`; position 0, a
+/// promoter widened to it, falls in the first region, as Perl's `int(-1 / 1e6)`
+/// puts it there.
 pub(crate) fn region_start(pos: u64) -> u64 {
-    ((pos - 1) / REGION_SIZE) * REGION_SIZE + 1
+    (pos.saturating_sub(1) / REGION_SIZE) * REGION_SIZE + 1
 }
 
 /// Statistics from the cache build.
@@ -358,7 +361,7 @@ pub struct BuildSources<'a> {
     pub protein_sequences: Option<&'a HashMap<String, Peptide>>,
     /// The prediction matrices of each protein FASTA record, under the
     /// record's key in `protein_sequences`.
-    pub prediction_data: Option<&'a HashMap<String, PeptidePredictions>>,
+    pub prediction_data: Option<&'a HashMap<String, Arc<PeptidePredictions>>>,
     pub genome_fasta: Option<&'a vep_fasta::IndexedFasta>,
     pub gtf_tags: Option<&'a crate::gtf::GtfTags>,
     pub core_dumps: Option<&'a CoreDumps>,
@@ -1929,7 +1932,7 @@ fn codon_table(
 }
 
 /// Convert fetched prediction data into the JSON-serializable cache format.
-fn convert_predictions(preds: &PeptidePredictions) -> CachePredictions {
+fn convert_predictions(preds: &Arc<PeptidePredictions>) -> CachePredictions {
     fn convert_blob(blob: &PredictionBlob) -> CachePredictionMatrix {
         CachePredictionMatrix {
             analysis: blob.analysis.clone(),
@@ -2750,7 +2753,7 @@ mod tests {
             let proteins = peptides(key, "MPKALU");
             let predictions = HashMap::from([(
                 key.to_string(),
-                PeptidePredictions {
+                Arc::new(PeptidePredictions {
                     sift: Some(PredictionBlob {
                         analysis: "sift".to_string(),
                         sub_analysis: None,
@@ -2758,7 +2761,7 @@ mod tests {
                         base64_data: "matrix".to_string(),
                     }),
                     ..PeptidePredictions::default()
-                },
+                }),
             )]);
             let with_predictions = BuildSources {
                 prediction_data: Some(&predictions),
@@ -2857,7 +2860,7 @@ mod tests {
             let proteins = peptides("ENST1", residues);
             let predictions = HashMap::from([(
                 "ENST1".to_string(),
-                PeptidePredictions {
+                Arc::new(PeptidePredictions {
                     sift: Some(PredictionBlob {
                         analysis: "sift".to_string(),
                         sub_analysis: None,
@@ -2865,7 +2868,7 @@ mod tests {
                         base64_data: "matrix".to_string(),
                     }),
                     ..PeptidePredictions::default()
-                },
+                }),
             )]);
             let with_predictions = BuildSources {
                 prediction_data: Some(&predictions),

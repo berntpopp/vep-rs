@@ -110,6 +110,9 @@ pub const SOURCE_FIELDS: &[&str] = &["SOURCE", "source"];
 
 pub const REFSEQ_SOURCE: &str = "RefSeq";
 
+/// The fields Constants.pm:97-98 adds to a row only under `--refseq` or `--merged`.
+const REFSEQ_MATCH_FIELDS: &[&str] = &["REFSEQ_MATCH", "refseq_match"];
+
 /// The notes of a floor a format cannot count: the JSON format's row-less columns, a custom
 /// source's columns in the JSON format (JSON.pm:249-258 at release/116.3 put a record's custom
 /// annotations, their statistics first, on the record object alone), and a column neither
@@ -120,7 +123,7 @@ pub const NEAREST_FIELDS: &[&str] = &["NEAREST", "nearest"];
 
 /// The largest structural variant the reference annotates where a run names no other
 /// bound: the bound a record's skip route is read under.
-const MAX_SV_SIZE: i64 = 10_000_000;
+pub(crate) const MAX_SV_SIZE: i64 = 10_000_000;
 
 /// The stale documented divergences a report lists.
 const STALE_LISTED: usize = 20;
@@ -793,9 +796,10 @@ fn grouped(entries: &[&Entry], examples: i64) -> Value {
 /// MOTIF_SCORE_CHANGE on a reverse-strand motif entry whose allele is two or more bases,
 /// counted under the class. `MERGED_SAME_STABLE_ID_COLLAPSE` in `documented.masks`
 /// accepts a Transcript entry the candidate alone writes, of a model the reference wrote no row
-/// for on a record it wrote a Transcript row for, its SOURCE RefSeq or absent, once per record
-/// and allele, counted under the class, and leaves such a record's `most_severe_consequence`
-/// uncompared. Each class of `TERM_PAIR_CLASSES` in `documented.masks` accepts the
+/// for on a record it wrote a Transcript row for, its SOURCE RefSeq or absent (absent only
+/// where a reference row carries REFSEQ_MATCH), once per record and allele, counted under the
+/// class, and leaves such a record's `most_severe_consequence` uncompared.
+/// Each class of `TERM_PAIR_CLASSES` in `documented.masks` accepts the
 /// Consequence of a pair its predicate admits, the row counted once and its other fields
 /// compared, and leaves such a record's `most_severe_consequence` uncompared; a predicate is
 /// asked with the coding ends `side.partial_codon_models` holds of the row's transcript. On
@@ -997,6 +1001,13 @@ pub fn compare_entries<'a>(
         // A lost copy's row once per record and allele: a repeat of one is a duplicate, whatever
         // the format's key spells (the text key omits the Uploaded_variation the label carries).
         let mut accepted_rows: HashSet<(String, &str, &str)> = HashSet::new();
+        // A row without SOURCE is a RefSeq cache's only where the reference's rows, those
+        // kept back included, carry REFSEQ_MATCH, which a run under neither `--refseq` nor
+        // `--merged` writes.
+        let refseq_run = REFSEQ_MATCH_FIELDS.iter().any(|f| {
+            expected.iter().any(|e| e.fields.contains_key(*f))
+                || kept.is_some_and(|k| k.populated.get(f) > 0 || k.present.contains(*f))
+        });
         for a in actual {
             if expected_keys.contains(a.key.as_str()) || documented.extra(a) || !transcript_entry(a)
             {
@@ -1013,7 +1024,9 @@ pub fn compare_entries<'a>(
                 .find_map(|f| a.fields.get(*f))
                 .map_or(ABSENT, String::as_str);
             let row = (label, a.allele.as_str(), a.feature.as_str());
-            if (blank(source) || source == REFSEQ_SOURCE) && !accepted_rows.contains(&row) {
+            if ((blank(source) && refseq_run) || source == REFSEQ_SOURCE)
+                && !accepted_rows.contains(&row)
+            {
                 accepted_rows.insert(row);
                 collapsed_rows.insert(&a.key);
                 if let Some(record) = a.record {
@@ -1126,6 +1139,7 @@ pub fn compare_entries<'a>(
     // rows, set aside where the collapsed rows are. A key a manifest documents is the manifest's.
     let mut skipped = CandidateOnly::default();
     let mut own_rows = CandidateOnly::default();
+    let mut mate_rows = CandidateOnly::default();
     if let Some(variants) = side
         .structural_variants
         .as_ref()
@@ -1199,8 +1213,31 @@ pub fn compare_entries<'a>(
                 &variants.spans,
             );
             candidate_only_rows(documented, &excluded, &mut own_rows);
+            let excluded = structural::filter_bnd_synonym_mate_rows(
+                &perl_tuples,
+                &rust_tuples,
+                &variants.by_chr,
+                &variants.spans,
+            );
+            candidate_only_rows(documented, &excluded, &mut mate_rows);
         }
     }
+    // A record the reference wrote no row for whose every candidate row is a lost row of
+    // `bnd_own_chromosome_rows_lost`: the reference's VCF line carries no CSQ at all.
+    let lost = |key: &str| own_rows.rows.contains(key) || mate_rows.rows.contains(key);
+    // The records with a reference row, or a candidate row the class keeps, in one pass.
+    let written: HashSet<i64> = expected
+        .iter()
+        .chain(actual.iter().filter(|a| !lost(&a.key)))
+        .filter(|e| !record_key(&e.key))
+        .filter_map(|e| e.record)
+        .collect();
+    let rows_lost_whole: HashSet<i64> = mate_rows
+        .records
+        .iter()
+        .copied()
+        .filter(|record| !written.contains(record))
+        .collect();
     let mut stale: Vec<String> = Vec::new();
     // For each manifest item that states `rows_alike`: the rows of its key that carry its
     // field, and those of them on which both engines print one value.
@@ -1312,6 +1349,7 @@ pub fn compare_entries<'a>(
                 || registry_records.contains(&record)
                 || collapsed_records.contains(&record)
                 || own_rows.records.contains(&record)
+                || mate_rows.records.contains(&record)
         });
         // A record that carries a row a class of a coding end took, and no row another
         // mechanism sets aside, has its `most_severe_consequence` derived on each side.
@@ -1334,6 +1372,10 @@ pub fn compare_entries<'a>(
         names.dedup();
         for name in names {
             if record_summary_differs && name == "most_severe_consequence" {
+                continue;
+            }
+            if name == "CSQ_present" && summary_record.is_some_and(|r| rows_lost_whole.contains(&r))
+            {
                 continue;
             }
             if extra_differs && name == "Extra" {
@@ -1594,6 +1636,8 @@ pub fn compare_entries<'a>(
             ))
         } else if own_rows.rows.contains(a.key.as_str()) {
             Some((BND_OWN_CHROMOSOME_ROWS_LOST, "candidate-only own-end row"))
+        } else if mate_rows.rows.contains(a.key.as_str()) {
+            Some((BND_OWN_CHROMOSOME_ROWS_LOST, "candidate-only mate row"))
         } else {
             None
         };

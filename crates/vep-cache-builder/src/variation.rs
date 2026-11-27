@@ -816,9 +816,7 @@ impl AllVarsWriter {
         self.line.push_str(&self.chr);
         for column in self.columns.iter().skip(1) {
             self.line.push('\t');
-            let cell = record.cell(column);
-            self.line
-                .push_str(if cell.is_empty() { "." } else { &cell });
+            record.write_cell(column, &mut self.line);
         }
         self.line.push('\n');
         let begin = self.writer.virtual_position();
@@ -896,50 +894,41 @@ pub fn write_chromosome(
 }
 
 impl VariationRecord {
-    /// The text of one cell, empty when the dumper leaves it empty
-    /// (`Dumper/Variation.pm:233-250`: `failed`, `somatic` and
+    /// Appends the text of one cell to `out`, `.` when the dumper leaves it
+    /// empty (`Dumper/Variation.pm:233-250`: `failed`, `somatic` and
     /// `phenotype_or_disease` when 0, `end` when it equals `start`, `strand`
     /// when 1).
-    fn cell(&self, column: &str) -> String {
-        let flag = |value: u8| {
-            if value == 0 {
-                String::new()
-            } else {
-                value.to_string()
+    fn write_cell(&self, column: &str, out: &mut String) {
+        use std::fmt::Write;
+        let before = out.len();
+        fn text(value: &Option<String>) -> &str {
+            value.as_deref().unwrap_or_default()
+        }
+        // Writing to a `String` cannot fail.
+        let _ = match column {
+            "variation_name" => out.write_str(&self.variation_name),
+            "failed" if self.failed != 0 => write!(out, "{}", self.failed),
+            "somatic" if self.somatic != 0 => write!(out, "{}", self.somatic),
+            "start" => write!(out, "{}", self.start),
+            "end" if self.end != self.start => write!(out, "{}", self.end),
+            "allele_string" => out.write_str(&self.allele_string),
+            "strand" if self.strand != 1 => write!(out, "{}", self.strand),
+            "clin_sig" => out.write_str(text(&self.clin_sig)),
+            "phenotype_or_disease" if self.phenotype_or_disease != 0 => {
+                write!(out, "{}", self.phenotype_or_disease)
+            }
+            "clin_sig_allele" => out.write_str(text(&self.clin_sig_allele)),
+            "clin_sig_ref_allele" => out.write_str(text(&self.clin_sig_ref_allele)),
+            "clinical_impact" => out.write_str(text(&self.clinical_impact)),
+            "pubmed" => out.write_str(text(&self.pubmed)),
+            "var_synonyms" => out.write_str(text(&self.var_synonyms)),
+            "failed" | "somatic" | "end" | "strand" | "phenotype_or_disease" => Ok(()),
+            population => {
+                out.write_str(self.frequencies.get(population).map_or("", String::as_str))
             }
         };
-        match column {
-            "variation_name" => self.variation_name.clone(),
-            "failed" => flag(self.failed),
-            "somatic" => flag(self.somatic),
-            "start" => self.start.to_string(),
-            "end" => {
-                if self.end == self.start {
-                    String::new()
-                } else {
-                    self.end.to_string()
-                }
-            }
-            "allele_string" => self.allele_string.clone(),
-            "strand" => {
-                if self.strand == 1 {
-                    String::new()
-                } else {
-                    self.strand.to_string()
-                }
-            }
-            "clin_sig" => self.clin_sig.clone().unwrap_or_default(),
-            "phenotype_or_disease" => flag(self.phenotype_or_disease),
-            "clin_sig_allele" => self.clin_sig_allele.clone().unwrap_or_default(),
-            "clin_sig_ref_allele" => self.clin_sig_ref_allele.clone().unwrap_or_default(),
-            "clinical_impact" => self.clinical_impact.clone().unwrap_or_default(),
-            "pubmed" => self.pubmed.clone().unwrap_or_default(),
-            "var_synonyms" => self.var_synonyms.clone().unwrap_or_default(),
-            population => self
-                .frequencies
-                .get(population)
-                .cloned()
-                .unwrap_or_default(),
+        if out.len() == before {
+            out.push('.');
         }
     }
 }
@@ -1475,7 +1464,13 @@ impl ThousandGenomes {
                 let mut entry = [f64::NAN; 5];
                 for (slot, population_values) in entry.iter_mut().zip(&values) {
                     if let Some(value) = population_values.get(index) {
-                        *slot = value.parse().unwrap_or(f64::NAN);
+                        // `perl_g4` prints finite numbers alone, so `inf` and an
+                        // overflow are read as absent.
+                        *slot = value
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .unwrap_or(f64::NAN);
                     }
                 }
                 record_alleles.push(entry);
@@ -1544,11 +1539,11 @@ impl ThousandGenomes {
                     column.push(format!("{cache_allele}:{}", perl_g4(*frequency)));
                 }
             }
-            if chromosomes > 0 {
-                columns[0].push(format!(
-                    "{cache_allele}:{}",
-                    perl_g4(count / chromosomes as f64)
-                ));
+            // No chromosome, or a count past `f64`'s range, gives no whole-panel
+            // frequency, which `perl_g4` could not print.
+            let panel = count / chromosomes as f64;
+            if panel.is_finite() {
+                columns[0].push(format!("{cache_allele}:{}", perl_g4(panel)));
             }
         }
         for (column, entries) in THOUSAND_GENOMES_COLUMNS.iter().zip(columns) {
@@ -1965,6 +1960,54 @@ mod tests {
         );
         assert!(frequencies("rs9").is_empty());
         assert!(frequencies("COSV1").is_empty());
+
+        // A frequency that is not finite, `inf` or one past `f64`'s range, is
+        // read as absent, as text that is not a number is.
+        let infinite = write_vcf(
+            dir.path(),
+            "1000GENOMES-infinite.vcf",
+            "21\t44195140\trs2838519\tG\tA\t.\t.\tdbSNP_156;TSA=SNV;E_Freq;E_1000G;AFR=inf;AMR=1e309;EAS=0.4534;EUR=0.6024;SAS=0.5583\n",
+        );
+        let inputs = GenomeWideInputs {
+            frequencies: Some(infinite),
+            ..Default::default()
+        };
+        let records = collect(&germline, &inputs, None);
+        let record = records
+            .iter()
+            .find(|r| r.variation_name == "rs2838519")
+            .unwrap();
+        assert!(
+            !record.frequencies.contains_key("AFR") && !record.frequencies.contains_key("AMR"),
+            "{:?}",
+            record.frequencies
+        );
+
+        // A finite frequency whose chromosome count overflows writes its own
+        // column and no whole-panel `AF`.
+        let huge = write_vcf(
+            dir.path(),
+            "1000GENOMES-huge.vcf",
+            "21\t44195140\trs2838519\tG\tA\t.\t.\tdbSNP_156;TSA=SNV;E_Freq;E_1000G;AFR=1e306;AMR=0.379;EAS=0.4534;EUR=0.6024;SAS=0.5583\n",
+        );
+        let inputs = GenomeWideInputs {
+            frequencies: Some(huge),
+            ..Default::default()
+        };
+        let records = collect(&germline, &inputs, None);
+        let record = records
+            .iter()
+            .find(|r| r.variation_name == "rs2838519")
+            .unwrap();
+        assert_eq!(
+            record.frequencies.get("AFR").map(String::as_str),
+            Some("A:1e+306")
+        );
+        assert!(
+            !record.frequencies.contains_key("AF"),
+            "{:?}",
+            record.frequencies
+        );
     }
 
     /// A frequency VCF allele matches a variant's allele through the minimised
