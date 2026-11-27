@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `hgvs_added_bases_left_at_the_span_end` in `vep-formats-compare` and `vep-plugin-pairs` reads a VCF or JSON row at its record's Location, so it sets aside those rows too.
   - `hgvs_shift_shared_across_alleles` in `vep-formats-compare` and `vep-plugin-pairs` takes a later in-frame insertion allele's `Codons` and `Amino_acids` as Ensembl VEP reads them at the moved pair.
   - `bnd_own_chromosome_rows_lost` in `vep-formats-compare` and `vep-sv-compare` sets aside the mate rows of a breakend whose `CHR`-spelled mate Ensembl VEP leaves without CSQ.
+  - `vep-formats-compare` takes `shifted_allele_rotation_by_strand` HGVSp pairs from the rows alone, and `hgvs_shift_shared_across_alleles` a later allele's `Consequence` and `HGVSp` read at the first allele's shifted pair. (#186)
 
 ## [1.0.0] - 2026-11-24
 

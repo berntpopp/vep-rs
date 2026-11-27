@@ -258,7 +258,7 @@ pub const UTRANNOTATOR_EXISTING_FIELDS: &[&str] = &[
     "Existing_uORFs",
 ];
 
-/// `hgvs_shift_shared_across_alleles` beside the candidate JSON cache: three columns of a
+/// `hgvs_shift_shared_across_alleles` beside the candidate JSON cache: six columns of a
 /// later allele's row are decided without a manifest. The alleles of a record share one
 /// TranscriptVariation per transcript, which keeps the CDS pair and the translation pair once
 /// read (BaseTranscriptVariation.pm:252-267, :365-380). The first allele's protein notation
@@ -279,7 +279,11 @@ pub const UTRANNOTATOR_EXISTING_FIELDS: &[&str] = &[
 /// the two Amino_acids share their alternate part, each side's reference part the coding
 /// sequence's translation over its codons under the transcript's table. On an in-frame
 /// insertion's row run without statistics each side's Amino_acids and Codons are instead the
-/// window `inserted_window` reads at its pair. A first allele's row,
+/// window `inserted_window` reads at its pair. On such a row the Consequence is the class's
+/// where the two sets differ only in the term each side's Amino_acids gives, and an HGVSp,
+/// written at the allele's own shift (TranscriptVariationAllele.pm:1724-1733), where it
+/// differs by the rotation of `shifted_allele_rotation_by_strand` alone
+/// (`later_allele_terms_or_notation`). A first allele's row,
 /// a first allele without an offset, a move of another size, a candidate value that is not the
 /// record's own, any other column, a row whose record's alleles no entry states in order and a
 /// transcript the cache holds without its mapper pairs stay differences; without the cache the
@@ -294,6 +298,10 @@ pub const SHARED_SHIFT_FIELDS: &[&str] = &[
     "Amino_acids",
     "Codons",
     "codons",
+    "Consequence",
+    "consequence_terms",
+    "HGVSp",
+    "hgvsp",
 ];
 
 /// ensembl-variation Utils/Constants.pm %OVERLAP_CONSEQUENCES at release/116, SO term to rank.
