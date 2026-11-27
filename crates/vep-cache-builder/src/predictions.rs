@@ -710,6 +710,12 @@ mod tests {
             refusal(b"1\t2\tab\tcd\n"),
             "<file> row 1 has 4 columns, the schema has 3"
         );
+        // A raw tab inside a matrix makes a row wider than three columns,
+        // which the shared reader would read as its first three.
+        assert_eq!(
+            refusal(b"1\t2\tab\n3\t4\tc\td\te\n"),
+            "<file> row 2 has 5 columns, the schema has 3"
+        );
         for cut in [
             &b"1\t2\tab\n3\t4\tcd"[..],
             b"1\t2\tab\n3\t4\tcd\\",
