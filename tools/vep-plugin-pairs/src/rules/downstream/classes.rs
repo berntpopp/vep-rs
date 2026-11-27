@@ -15,7 +15,7 @@ use crate::pytext;
 use crate::rules::coding_end::coding_end_class;
 use crate::rules::entry::{blank, consequence_set, field_named, field_of, Entry, Row, ABSENT};
 use crate::rules::shared::{
-    digits_value, integer_of, is_integer, notation_indel_length, reverse_complement,
+    digits_value, insertion_row, integer_of, is_integer, notation_indel_length, reverse_complement,
     FRAMESHIFT_TERM, HGVSC_FIELDS, HGVS_OFFSET_FIELDS, STRAND_FIELDS,
 };
 use crate::rules::term_pair::{
@@ -592,7 +592,10 @@ pub fn later_allele_shared_shift(
         // An insertion's pair is read either way round; its window runs from the lower base.
         let ordered = |pair: (i128, i128)| (pair.0.min(pair.1), pair.0.max(pair.1));
         let (moved, own) = (ordered(moved), ordered(own));
-        if moved.1 == moved.0 + 1
+        // A replacement of two neighbouring bases prints the pair an insertion does.
+        let inserted = insertion_row(e) && e.insertion != Some(false);
+        if inserted
+            && moved.1 == moved.0 + 1
             && own.1 == own.0 + 1
             && !e.allele.is_empty()
             && e.allele.bytes().all(|base| b"ACGT".contains(&base))
@@ -640,7 +643,7 @@ pub fn later_allele_shared_shift(
             continue;
         }
         // An insertion between two codons replaces no residue.
-        let between_codons = (own.0 - own.1).abs() == 1 && own.0.min(own.1) % 3 == 0;
+        let between_codons = inserted && (own.0 - own.1).abs() == 1 && own.0.min(own.1) % 3 == 0;
         let own_read = match between_codons {
             true => Some("-".to_string()),
             false => codon_residues(transcript, own_codons),

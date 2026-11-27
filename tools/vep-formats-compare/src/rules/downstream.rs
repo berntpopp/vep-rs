@@ -42,6 +42,7 @@ use crate::self_parity::reverse_complement;
 use crate::shared::blank;
 use crate::shared::consequence_set;
 use crate::shared::feature_kind;
+use crate::shared::insertion_row;
 use crate::shared::integer_text_of;
 use crate::shared::ABSENT;
 use crate::shared::FRAMESHIFT_TERM;
@@ -1388,7 +1389,10 @@ pub fn later_allele_shared_shift(
         // An insertion's pair is read either way round; its window runs from the lower base.
         let ordered = |pair: (i64, i64)| (pair.0.min(pair.1), pair.0.max(pair.1));
         let (moved, own) = (ordered(moved), ordered(own));
-        if moved.1 == moved.0 + 1
+        // A replacement of two neighbouring bases prints the pair an insertion does.
+        let inserted = insertion_row(e) && e.insertion != Some(false);
+        if inserted
+            && moved.1 == moved.0 + 1
             && own.1 == own.0 + 1
             && spelt_in(&e.allele, b"ACGT")
             && e.allele.len().is_multiple_of(3)
@@ -1437,7 +1441,7 @@ pub fn later_allele_shared_shift(
         }
         let read = |codons, reading| codon_residues(&transcript, codons, reading);
         // An insertion between two codons replaces no residue.
-        let between_codons = (own.0 - own.1).abs() == 1 && own.0.min(own.1) % 3 == 0;
+        let between_codons = inserted && (own.0 - own.1).abs() == 1 && own.0.min(own.1) % 3 == 0;
         let own_read = match between_codons {
             true => Some("-".to_string()),
             false => read(own_codons, Reading::VepRs),
