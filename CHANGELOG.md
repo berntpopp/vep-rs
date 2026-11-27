@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - HGVS, SPDI and identifiers
-  - An HGVS `dup` on a forward-strand transcript whose span ends past the 64-bit range is refused instead of read as an insertion at a wrapped position.
+  - An HGVS `dup` on a forward-strand transcript whose span ends past the 64-bit range is refused instead of read as an insertion at a wrapped position. (#137)
 
 ## [1.0.0] - 2026-11-24
 
