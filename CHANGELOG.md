@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HGVS, SPDI and identifiers
   - An HGVS `dup` on a forward-strand transcript whose span ends past the 64-bit range is refused instead of read as an insertion at a wrapped position.
 
+### Fixed
+
+- Output formats, columns and headers
+  - A `--output_format parquet` run that fails removes its temporary directory, since a dropped `ParquetDirectoryWriter` now waits for its encoder thread instead of leaving it writing parts.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
