@@ -1253,7 +1253,7 @@ fn a_dup_that_counts_no_bases_reads_the_distance_from_the_alleles_where_a_row_ca
     }
 }
 
-/// Issue 26's `end_run` record (`chr16 15725140 AA A,AAA`) on a forward-strand transcript whose
+/// The record `chr16 15725140 AA A,AAA` on a forward-strand transcript whose
 /// last exon ends inside the run: the reference's `c.*890dup` and the candidate's `c.*898dup`
 /// carried 8 bases, read as VCF entries, which carry their Location as `allele_location` alone.
 #[test]
