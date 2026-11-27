@@ -768,6 +768,9 @@ type HeldIndex = (Arc<TranscriptIndex>, Option<Arc<[usize]>>);
 #[derive(Default)]
 pub(crate) struct BatchTranscripts {
     indexes: FxHashMap<String, HeldIndex>,
+    /// The batch's regulatory features under `--regulatory`
+    /// ([`crate::regulatory::RegulatorySource::snapshot`]).
+    pub(crate) regulatory: Option<crate::regulatory::RegulatorySource>,
 }
 
 impl BatchTranscripts {
@@ -1654,7 +1657,10 @@ impl LazyTranscriptIndexes {
             .iter()
             .filter_map(|(chr, slot)| Some((chr.clone(), (Arc::clone(slot.get()?), None))))
             .collect();
-        BatchTranscripts { indexes }
+        BatchTranscripts {
+            indexes,
+            regulatory: None,
+        }
     }
 
     /// Drops the cache's hold on `chr`'s index, which a batch that took it

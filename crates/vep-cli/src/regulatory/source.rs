@@ -308,10 +308,22 @@ struct Chromosome {
     name: String,
     /// The cache's shards; none for a GFF source.
     shards: Vec<PathBuf>,
-    index: OnceLock<Index>,
+    /// The features [`RegulatorySource::prewarm`] loaded, kept to the end, or
+    /// a batch's own ([`RegulatorySource::snapshot`]).
+    index: OnceLock<Arc<Index>>,
     // Held by the one loader of this chromosome while its features load, so two
     // chromosomes load side by side and a loaded one is never waited for.
-    loading: Mutex<()>,
+    held: Mutex<Held>,
+}
+
+/// The features a chromosome's batches last took ([`RegulatorySource::hold`]).
+#[derive(Default)]
+struct Held {
+    index: Option<Arc<Index>>,
+    /// Released once, at least; a chromosome loaded again after that is kept
+    /// to the end, so an unsorted input reloads a chromosome once at most.
+    released: bool,
+    kept: bool,
 }
 
 impl Chromosome {
@@ -320,7 +332,7 @@ impl Chromosome {
             name,
             shards,
             index: OnceLock::new(),
-            loading: Mutex::new(()),
+            held: Mutex::default(),
         })
     }
 }
@@ -347,7 +359,10 @@ pub struct RegulatorySource {
     /// ([`vep_core::synonyms::ChromosomeSynonyms::aliases_of`]),
     /// so a lookup is one hash probe whatever the two name it.
     chromosomes: FxHashMap<String, Arc<Chromosome>>,
-    backing: Backing,
+    backing: Arc<Backing>,
+    /// The chromosomes the last batch held ([`Self::snapshot`]), and those a
+    /// release found loading, released at the next batch.
+    last_batch: Mutex<Vec<String>>,
 }
 
 impl RegulatorySource {
@@ -406,7 +421,8 @@ impl RegulatorySource {
         }
         Ok(Arc::new(Self {
             chromosomes,
-            backing: Backing::Gff(gff),
+            backing: Arc::new(Backing::Gff(gff)),
+            last_batch: Mutex::default(),
         }))
     }
 
@@ -496,18 +512,19 @@ impl RegulatorySource {
         }
         Ok(Self {
             chromosomes,
-            backing: Backing::Shards {
+            backing: Arc::new(Backing::Shards {
                 manifest: Arc::clone(&cache.manifest),
                 matrices,
                 cell_types: cache.info.cell_types.clone(),
-            },
+            }),
+            last_batch: Mutex::default(),
         })
     }
 
     /// Whether the features come from the GFF files of `--regulatory_gff`
     /// rather than the cache's tree.
     pub fn reads_gff(&self) -> bool {
-        matches!(self.backing, Backing::Gff(_))
+        matches!(*self.backing, Backing::Gff(_))
     }
 
     /// The chromosomes the GFF files of `--regulatory_gff` list, under the
@@ -515,7 +532,7 @@ impl RegulatorySource {
     /// lacks (`RegFeat.pm` inherits `File.pm:369-372`); `None` for the cache's
     /// tree, whose chromosomes are the cache's own.
     pub(crate) fn gff_chromosomes(&self) -> Option<BTreeSet<String>> {
-        match &self.backing {
+        match &*self.backing {
             Backing::Shards { .. } => None,
             Backing::Gff(gff) => Some(gff.chromosomes()),
         }
@@ -524,7 +541,7 @@ impl RegulatorySource {
     /// The cache's binding matrices; `None` for a GFF source, whose motifs
     /// carry stubs built from their records.
     pub fn matrices(&self) -> Option<&BindingMatrices> {
-        match &self.backing {
+        match &*self.backing {
             Backing::Shards { matrices, .. } => Some(matrices),
             Backing::Gff(_) => None,
         }
@@ -533,7 +550,7 @@ impl RegulatorySource {
     /// The cache's cell-type list, in the order the activity codes follow;
     /// empty for a GFF source, which carries no epigenome activity.
     pub fn cell_types(&self) -> &[String] {
-        match &self.backing {
+        match &*self.backing {
             Backing::Shards { cell_types, .. } => cell_types,
             Backing::Gff(_) => &[],
         }
@@ -546,7 +563,7 @@ impl RegulatorySource {
     /// unloaded. The cache's tree is not read: its shards load as a variant
     /// first names their chromosome, as transcript shards do.
     pub(crate) fn check_gff_records(&self) -> anyhow::Result<()> {
-        match &self.backing {
+        match &*self.backing {
             Backing::Shards { .. } => Ok(()),
             Backing::Gff(gff) => gff.check_records(),
         }
@@ -573,12 +590,18 @@ impl RegulatorySource {
         if chromosome.index.get().is_some() {
             return Ok(());
         }
-        let _guard = chromosome.loading.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = chromosome.held.lock().unwrap_or_else(|e| e.into_inner());
         if chromosome.index.get().is_some() {
             return Ok(());
         }
+        let _ = chromosome.index.set(Arc::new(self.load(chromosome)?));
+        Ok(())
+    }
+
+    /// Reads `chromosome`'s features, its caller holding its lock.
+    fn load(&self, chromosome: &Chromosome) -> anyhow::Result<Index> {
         let started = Instant::now();
-        let index = match &self.backing {
+        let index = match &*self.backing {
             Backing::Shards {
                 manifest,
                 matrices,
@@ -605,12 +628,99 @@ impl RegulatorySource {
                 started.elapsed().as_secs_f64() * 1e3
             )
         );
-        let _ = chromosome.index.set(index);
-        Ok(())
+        Ok(index)
+    }
+
+    /// The features of `chr` for the batches to share, loaded when no batch
+    /// holds them; `None` for a chromosome the source lacks.
+    fn hold(&self, chr: &str) -> anyhow::Result<Option<Arc<Index>>> {
+        let Some(chromosome) = self.chromosomes.get(chr) else {
+            return Ok(None);
+        };
+        if let Some(index) = chromosome.index.get() {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let mut held = chromosome.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = &held.index {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let index = Arc::new(self.load(chromosome)?);
+        held.kept |= held.released;
+        held.index = Some(Arc::clone(&index));
+        Ok(Some(index))
+    }
+
+    /// Loads `chr` for the batches to share ([`Self::hold`]), as a reader
+    /// warms a chromosome ahead of them; a chromosome the batches have
+    /// released is passed over, as one the input has left.
+    pub(crate) fn warm(&self, chr: &str) -> anyhow::Result<()> {
+        let released = self.chromosomes.get(chr).is_some_and(|chromosome| {
+            chromosome
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .released
+        });
+        if released {
+            return Ok(());
+        }
+        self.hold(chr).map(drop)
+    }
+
+    /// One batch's features: a source holding, for each of `chrs` the source
+    /// lists, the features [`Self::hold`] gives. The batches of a run are taken
+    /// in input order, so a chromosome the batch before held and this one does
+    /// not is one the input has left: the source releases it
+    /// ([`Self::release`]), as Ensembl VEP drops the regions that leave its
+    /// buffer (`AnnotationSource.pm:109-145`).
+    pub(crate) fn snapshot(&self, chrs: &[String]) -> anyhow::Result<Self> {
+        let mut chromosomes = FxHashMap::default();
+        for chr in chrs {
+            if let Some(index) = self.hold(chr)? {
+                let chromosome = Chromosome::new(chr.clone(), Vec::new());
+                let _ = chromosome.index.set(index);
+                chromosomes.insert(chr.clone(), chromosome);
+            }
+        }
+        let mut last = self.last_batch.lock().unwrap_or_else(|e| e.into_inner());
+        let loading: Vec<String> = last
+            .iter()
+            .filter(|chr| !chromosomes.contains_key(*chr) && !self.release(chr))
+            .cloned()
+            .collect();
+        *last = chromosomes.keys().cloned().chain(loading).collect();
+        Ok(Self {
+            chromosomes,
+            backing: Arc::clone(&self.backing),
+            last_batch: Mutex::default(),
+        })
+    }
+
+    /// Drops the source's hold on `chr`'s features, which a batch that took
+    /// them keeps until it is done; `false`, and nothing dropped, while a load
+    /// of the chromosome runs, so the coordinator never waits on a reader's
+    /// warm load. Features [`Self::prewarm`] loaded are never released.
+    pub(crate) fn release(&self, chr: &str) -> bool {
+        let Some(chromosome) = self.chromosomes.get(chr) else {
+            return true;
+        };
+        let mut held = match chromosome.held.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        if !held.kept && held.index.is_some() {
+            held.index = None;
+            held.released = true;
+        }
+        true
     }
 
     pub(super) fn index(&self, chr: &str) -> Option<&Index> {
-        self.chromosomes.get(chr).and_then(|c| c.index.get())
+        self.chromosomes
+            .get(chr)
+            .and_then(|c| c.index.get())
+            .map(|index| &**index)
     }
 
     /// The features of a loaded chromosome, by start; `None` before its
@@ -755,6 +865,40 @@ mod tests {
             "  chromosome mitochondrion_genome: 3 regulatory and motif features from 2 shards \
              in 12.2 ms"
         );
+    }
+
+    /// A batch keeps the features the source releases: a release meeting a
+    /// load leaves the chromosome held, the batch after it on another
+    /// chromosome releases the one the input left, a reader's warm load of it
+    /// is passed over, and a batch that comes back loads it again, kept to the
+    /// end.
+    #[test]
+    fn a_batch_keeps_the_regulatory_features_the_source_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_cache(dir.path(), &[]);
+        let other = dir.path().join("regulatory/22");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("1-1000000.json"), "[]").unwrap();
+        let source = RegulatorySource::open(&resolved_cache(dir.path()), true)
+            .unwrap()
+            .unwrap();
+        let held = |chr: &str| source.chromosomes[chr].held.lock().unwrap().index.is_some();
+        let first = source.snapshot(&["21".to_string()]).unwrap();
+        let loading = source.chromosomes["21"].held.lock().unwrap();
+        assert!(!source.release("21"));
+        drop(loading);
+        let _second = source.snapshot(&["22".to_string()]).unwrap();
+        assert!(!held("21"));
+        let mut v = variant(106, 106, b"C", b"G");
+        first.annotate(&mut v);
+        assert_eq!(v.transcript_consequences.len(), 2);
+        source.warm("21").unwrap();
+        assert!(!held("21"));
+        let again = source.snapshot(&["21".to_string()]).unwrap();
+        assert_eq!(again.features("21").unwrap().len(), 3);
+        let _ = source.snapshot(&["22".to_string()]).unwrap();
+        assert!(held("21"));
+        assert!(source.features("21").is_none());
     }
 
     /// A `.json.gz` shard loads as a `.json` shard does, through the transcript

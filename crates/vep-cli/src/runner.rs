@@ -4103,7 +4103,7 @@ impl AnnotationResources {
     /// Materialize chromosome-scoped caches before either streaming or batch workers run.
     /// One batch's transcript indexes over `reaches`
     /// ([`LazyTranscriptIndexes::snapshot`]), with each chromosome's
-    /// regulatory features warmed under `--regulatory`.
+    /// regulatory features under `--regulatory`.
     pub(crate) fn hold_batch(
         &self,
         reaches: Vec<(String, Reach)>,
@@ -4112,13 +4112,13 @@ impl AnnotationResources {
             Some(_) => reaches.iter().map(|(chr, _)| chr.clone()).collect(),
             None => Vec::new(),
         };
-        let batch = self.transcripts.snapshot(reaches)?;
+        let mut batch = self.transcripts.snapshot(reaches)?;
         if let Some(source) = self.regulatory_source.as_deref() {
-            for chr in &names {
+            batch.regulatory = Some(
                 source
-                    .prewarm(chr)
-                    .map_err(pipeline::regulatory_load_error)?;
-            }
+                    .snapshot(&names)
+                    .map_err(pipeline::regulatory_load_error)?,
+            );
         }
         Ok(Arc::new(batch))
     }
@@ -4537,7 +4537,7 @@ pub(crate) fn annotate_one(
         &resources.effects_config,
         transcript_filter,
     );
-    if let Some(source) = &resources.regulatory_source {
+    if let Some(source) = &transcripts.regulatory {
         source.annotate_variant(
             variant,
             &resources.effects_config,

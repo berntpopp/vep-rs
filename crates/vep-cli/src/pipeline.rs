@@ -1094,7 +1094,7 @@ pub(crate) fn prewarm_chromosome(
 ) -> anyhow::Result<()> {
     transcripts.warm_whole(chr)?;
     if let Some(source) = regulatory {
-        source.prewarm(chr).map_err(regulatory_load_error)?;
+        source.warm(chr).map_err(regulatory_load_error)?;
     }
     Ok(())
 }
