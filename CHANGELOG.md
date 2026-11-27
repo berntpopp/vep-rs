@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 - Documentation, test corpora and comparison tools
-  - `vep-formats-compare` streams a VCF or JSON comparison under the cross-record breakend and skipped-record classes, handing over only their records: ClinVar chr21 peak RSS 10.9 GB to 2.9 GB.
+  - `vep-formats-compare` streams a VCF or JSON comparison under the cross-record breakend and skipped-record classes, handing over only their records: ClinVar chr21 peak RSS 10.6 GB to 2.8 GB. (#179)
 
 ### Fixed
 
