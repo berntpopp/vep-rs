@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Caches, reference FASTA and the cache tools
   - `vep-cache-builder --auto` passes over a `CHECKSUMS` line whose name is not one bare file name, so a mirror cannot place or delete a file outside the work directory.
   - `vep-io`, `vep-effects`, `vep-cli` and `vep-cache-converter` drop dependencies their code never used: `noodles`, `tracing`, `indexmap`, `thiserror`, `csv` and `serde`.
+  - `cargo install vep-cache-converter` no longer compiles Parquet, Arrow or mimalloc, and `cargo install vep-cache-builder` deflates BGZF through libdeflate, as the release binaries do.
 
 ## [1.0.0] - 2026-11-24
 
