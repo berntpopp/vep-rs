@@ -471,15 +471,10 @@ pub trait BuiltinPlugin: sealed::Sealed + Send + Sync {
     }
 }
 
-/// The default reading of [`BuiltinPlugin::remote_data_file`]: the URL
-/// (`scheme://...`) a word names as a whole positional word, query and all,
-/// or as the value of `key=value`, which `params_to_hash` cuts at the value's
-/// first `=` (`perl_key_value`: `file=https://h/f?a=b` names `https://h/f?a`,
-/// the file Ensembl VEP's plugin opens).
 /// The default [`BuiltinPlugin::run_batch`] over one variant: every row the
 /// plugin annotates gets the fields its `run` returns, and the first failure
 /// comes back after the variant's last row. The warnings the rows raise go on
-/// under the variant's input record ([`about_record`]).
+/// under the variant's input record (`about_record`).
 fn run_rows<P: BuiltinPlugin + ?Sized>(
     plugin: &P,
     variant: &mut InputVariant,
@@ -514,7 +509,7 @@ fn run_rows<P: BuiltinPlugin + ?Sized>(
 /// The default [`BuiltinPlugin::run_batch`] with the variants spread over the
 /// current rayon pool, for a plugin whose `run` reads shared data alone: the
 /// fields, the warnings and the failure returned are the serial default's,
-/// the first failure in variant order ([`map_in_order`]).
+/// the first failure in variant order (`map_in_order`).
 pub(crate) fn run_batch_in_parallel<P: BuiltinPlugin + ?Sized>(
     plugin: &P,
     variants: &mut [InputVariant],
@@ -525,6 +520,11 @@ pub(crate) fn run_batch_in_parallel<P: BuiltinPlugin + ?Sized>(
         .unwrap_or(Ok(()))
 }
 
+/// The default reading of [`BuiltinPlugin::remote_data_file`]: the URL
+/// (`scheme://...`) a word names as a whole positional word, query and all,
+/// or as the value of `key=value`, which `params_to_hash` cuts at the value's
+/// first `=` (`perl_key_value`: `file=https://h/f?a=b` names `https://h/f?a`,
+/// the file Ensembl VEP's plugin opens).
 pub(crate) fn default_remote_data_file(param: &str) -> Option<&str> {
     use crate::custom::grammar::is_remote;
     if is_remote(param) {

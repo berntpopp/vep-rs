@@ -394,12 +394,6 @@ mod tests {
         })
     }
 
-    /// Deleting CDS base 5 (the second `A` of `AAA`, codon 2) leaves
-    /// `ATG AAA CTC TTG CTG TCC GTG GTT AAG GGC CCA AAT AGC CC` with the UTR
-    /// appended: Ensembl VEP's downstream translation starts at codon 2
-    /// (`last_complete_codon` of 5 is 3) and reads `KLLLSVVKGPNS` to the end of
-    /// the bases, no stop in frame, and the whole changed protein
-    /// `MKLLLSVVKGPNS` is 13 long against the reference's 8.
     /// Translating up to the first stop gives the whole translation cut at its
     /// first stop (`s/\*.*//`): a stop in the first piece, past it or none,
     /// a partial last codon, an ambiguous codon, and a table that is not known.
@@ -435,6 +429,12 @@ mod tests {
             .map_or(peptide, |stop| &peptide[..stop])
     }
 
+    /// Deleting CDS base 5 (the second `A` of `AAA`, codon 2) leaves
+    /// `ATG AAA CTC TTG CTG TCC GTG GTT AAG GGC CCA AAT AGC CC` with the UTR
+    /// appended: Ensembl VEP's downstream translation starts at codon 2
+    /// (`last_complete_codon` of 5 is 3) and reads `KLLLSVVKGPNS` to the end of
+    /// the bases, no stop in frame, and the whole changed protein
+    /// `MKLLLSVVKGPNS` is 13 long against the reference's 8.
     #[test]
     fn a_deletion_translates_from_its_codon_into_the_utr() {
         let tc = row(&[Consequence::FrameshiftVariant], Some("5"), 1);
