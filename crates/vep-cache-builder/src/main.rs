@@ -78,6 +78,7 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use rayon::prelude::*;
 use tracing::{info, warn};
 use vep_core::stderr;
 
@@ -96,6 +97,9 @@ use count::counted;
 /// The flags of a `--auto` installation; every flag of a build named one input
 /// at a time is refused beside any of them.
 const INSTALL_FLAGS: [&str; 3] = ["auto", "dir_cache", "site"];
+
+/// The chromosomes whose variation files are written at once.
+const CHROMOSOMES_IN_FLIGHT: usize = 4;
 
 #[derive(Parser)]
 #[command(name = "vep-cache-builder", version = env!("CARGO_PKG_VERSION"))]
@@ -1061,25 +1065,45 @@ fn write_variation_files(
     let columns = variation::variation_columns(variation_inputs.genome_wide.frequencies.is_some());
     let mut total_variations = 0usize;
     let mut files = 0usize;
-    for (chrom, vcf) in &variation_inputs.per_chromosome {
-        if from_tables.contains(chrom) {
-            continue;
-        }
+    let from_vcfs: Vec<_> = variation_inputs
+        .per_chromosome
+        .iter()
+        .filter(|(chrom, _)| !from_tables.contains(chrom))
+        .collect();
+    for (chrom, vcf) in &from_vcfs {
         info!(
             "Reading the variation records of chromosome {}: {}",
             chrom,
             vcf.path().display()
         );
-        total_variations += variation::write_chromosome(
-            chrom,
-            vcf,
-            &variation_inputs.genome_wide,
-            clinvar.as_ref(),
-            cells.as_ref(),
-            &columns,
-            output_dir,
-        )
-        .with_context(|| format!("Failed to write the variation file of chromosome {}", chrom))?;
+    }
+    // Each chromosome in flight holds its own frequency table, so a few are
+    // written at a time; the first error in chromosome order is the one reported.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(CHROMOSOMES_IN_FLIGHT)
+        .build()
+        .context("Failed to start the variation writers")?;
+    let written: Vec<Result<usize>> = pool.install(|| {
+        from_vcfs
+            .par_iter()
+            .map(|(chrom, vcf)| {
+                variation::write_chromosome(
+                    chrom,
+                    vcf,
+                    &variation_inputs.genome_wide,
+                    clinvar.as_ref(),
+                    cells.as_ref(),
+                    &columns,
+                    output_dir,
+                )
+                .with_context(|| {
+                    format!("Failed to write the variation file of chromosome {}", chrom)
+                })
+            })
+            .collect()
+    });
+    for records in written {
+        total_variations += records?;
         files += 1;
     }
 
