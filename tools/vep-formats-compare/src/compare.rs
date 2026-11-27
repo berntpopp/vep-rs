@@ -120,7 +120,7 @@ pub const NEAREST_FIELDS: &[&str] = &["NEAREST", "nearest"];
 
 /// The largest structural variant the reference annotates where a run names no other
 /// bound: the bound a record's skip route is read under.
-const MAX_SV_SIZE: i64 = 10_000_000;
+pub(crate) const MAX_SV_SIZE: i64 = 10_000_000;
 
 /// The stale documented divergences a report lists.
 const STALE_LISTED: usize = 20;

@@ -1138,3 +1138,104 @@ fn the_comparisons_outside_the_stream_are_made_on_the_whole_outputs() {
         "the whole outputs were compared: only a default, tab, vcf, json or parquet comparison is handed over"
     );
 }
+
+/// A VCF comparison with the input under the classes that read across records streams the
+/// outputs and hands over only the groups they can touch: a record the reference may skip
+/// (`<CPX>`, which the reference writes no line for), a record within its span, and a
+/// bracket breakend. The plain records before and after are kept back, and the report, the standard output and the exit code are those of
+/// the whole outputs.
+#[test]
+fn the_classes_that_read_across_records_hand_over_only_the_groups_they_touch() {
+    let directory = scratch("structural-read-across");
+    let records = [
+        "21\t1000\ts1\tA\tG\t.\t.\t.",
+        "21\t5000\tskip\tN\t<CPX>\t.\t.\tSVTYPE=CPX;END=5100",
+        "21\t5050\tbeside\tA\tT\t.\t.\t.",
+        "21\t100000\tbnd1\tN\tN[22:5000000[\t.\t.\tSVTYPE=BND",
+        "21\t200000\tfar\tC\tT\t.\t.\t.",
+    ];
+    let input = structural_input(&directory.join("in.vcf"), &records);
+    let cache = breakend_cache(&directory.join("cache"));
+    let header = "##fileformat=VCFv4.2\n##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from Ensembl VEP. \
+                  Format: Allele|Consequence|Feature_type|Feature\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+    let line = |record: &str, csq: &str| {
+        let (columns, _) = record.rsplit_once('\t').expect("an INFO column");
+        format!("{columns}\tCSQ={csq}\n")
+    };
+    let rows = [
+        "G|intron_variant|Transcript|ENST1",
+        "",
+        "T|intron_variant|Transcript|ENST1",
+        "N[22:5000000[|upstream_gene_variant|Transcript|ENST22",
+        "T|intergenic_variant||",
+    ];
+    let output = |skipped_rows: bool| {
+        let mut text = header.to_string();
+        for (record, csq) in records.iter().zip(rows) {
+            match (csq.is_empty(), skipped_rows) {
+                (true, false) => {}
+                (true, true) => text.push_str(&format!(
+                    "{record};CSQ=<CPX>|intron_variant|Transcript|ENST1\n"
+                )),
+                _ => text.push_str(&line(record, csq)),
+            }
+        }
+        text
+    };
+    let expected = directory.join("expected.vcf");
+    let actual = directory.join("actual.vcf");
+    std::fs::write(&expected, output(false)).expect("the reference is written");
+    std::fs::write(&actual, output(true)).expect("the candidate is written");
+    let masks = [SKIPPED, MATE_READ, OWN_ROWS].join(",");
+    let mut seen = Vec::new();
+    for whole in [true, false] {
+        let report = directory.join(format!("report.{whole}.json"));
+        let ran = run(
+            &[
+                "--format",
+                "vcf",
+                "--expected",
+                path_text(&expected),
+                "--actual",
+                path_text(&actual),
+                "--input",
+                path_text(&input),
+                "--json-cache",
+                path_text(&cache),
+                "--masks",
+                &masks,
+                "--report",
+                path_text(&report),
+            ],
+            whole,
+        );
+        seen.push((std::fs::read(&report).ok(), ran.out, ran.code, ran.err));
+    }
+    let (handed, whole) = (seen.pop().expect("two runs"), seen.pop().expect("two runs"));
+    assert_eq!(
+        (&handed.0, &handed.1, handed.2),
+        (&whole.0, &whole.1, whole.2),
+        "{}",
+        handed.3
+    );
+    assert_eq!(handed.1, "vcf: green\n");
+    let mut front_end = FrontEnd::new(STREAM);
+    hand_over(
+        &mut front_end,
+        "vcf",
+        &expected,
+        &actual,
+        &documented_with(&[SKIPPED, MATE_READ, OWN_ROWS]),
+        false,
+        None,
+        &[],
+        Some(&input),
+    )
+    .expect("the outputs are read");
+    assert_eq!(
+        front_end.note,
+        format!(
+            "2 of 4 reference lines were kept back by {STREAM}, 3 of 5 record groups handed over"
+        )
+    );
+}
