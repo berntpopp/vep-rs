@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads.
 - Tabix tables indexed on their start column alone (`gnomADc`, `CADD`, `SpliceAI` and others) read only each batch's own windows, side by side: 56 percent less wall time for `gnomADc` on ClinVar chr21, 16 threads.
 - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file.
+- Caches, reference FASTA and the cache tools
+  - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 - Documentation, test corpora and comparison tools
