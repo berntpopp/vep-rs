@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `hgvs_shift_shared_across_alleles` in `vep-formats-compare` takes a later in-frame insertion allele's `Codons` and `Amino_acids` as Ensembl VEP reads them at the moved pair.
   - `bnd_own_chromosome_rows_lost` in `vep-formats-compare` and `vep-sv-compare` sets aside the mate rows of a breakend whose `CHR`-spelled mate Ensembl VEP leaves without CSQ.
 
+### Fixed
+
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-converter` refuses an `--output-dir` that is its `--json-dir` before writing anything; the conversion deleted the source's `info.json` and emptied its variation files.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
