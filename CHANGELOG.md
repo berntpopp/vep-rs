@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Library crates
+  - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once.
+
 ### Changed
 
 - Input formats and records
@@ -18,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The `--vcf` writer builds each `CSQ` entry in one buffer and `--json` builds each object once: 5 to 8 percent less CPU time on 50,000 1000 Genomes chr21 sites.
 - Command line, configuration and errors
   - The refusal of an input whose format cannot be detected, a header-only VCF among them, names `--format`, and `--format vcf` for a VCF with no records.
+- Plugins
+  - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 - Documentation, test corpora and comparison tools
