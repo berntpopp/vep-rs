@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -130,7 +131,7 @@ pub fn fetch_predictions(
     assembly: &str,
     host: &str,
     port: u16,
-) -> Result<HashMap<String, PeptidePredictions>> {
+) -> Result<HashMap<String, Arc<PeptidePredictions>>> {
     let db_name = prediction_database(species, release, assembly)?;
     if peptide_by_transcript.is_empty() {
         return Ok(HashMap::new());
@@ -191,22 +192,23 @@ fn transcripts_by_md5(
 }
 
 /// The prediction data of each transcript: the matrices found under its
-/// peptide's MD5, none for a peptide the database holds no matrix of.
+/// peptide's MD5, none for a peptide the database holds no matrix of. The
+/// transcripts of one peptide share its one record.
 fn predictions_by_transcript(
     md5_to_transcripts: &HashMap<String, Vec<String>>,
     matrices: Vec<(String, FetchedMatrix)>,
-) -> HashMap<String, PeptidePredictions> {
+) -> HashMap<String, Arc<PeptidePredictions>> {
     let mut by_md5: HashMap<String, Vec<FetchedMatrix>> = HashMap::new();
     for (md5, matrix) in matrices {
         by_md5.entry(md5).or_default().push(matrix);
     }
 
-    let mut result: HashMap<String, PeptidePredictions> = HashMap::new();
+    let mut result: HashMap<String, Arc<PeptidePredictions>> = HashMap::new();
     for (md5, tx_ids) in md5_to_transcripts {
         let matrices = by_md5.get(md5).map(|v| v.as_slice()).unwrap_or(&[]);
-        let predictions = build_peptide_predictions(matrices, md5);
+        let predictions = Arc::new(build_peptide_predictions(matrices, md5));
         for tx_id in tx_ids {
-            result.insert(tx_id.clone(), predictions.clone());
+            result.insert(tx_id.clone(), Arc::clone(&predictions));
         }
     }
     result
@@ -221,7 +223,7 @@ fn predictions_by_transcript(
 pub fn read_prediction_dumps(
     peptide_by_transcript: &HashMap<String, Peptide>,
     dir: &Path,
-) -> Result<HashMap<String, PeptidePredictions>> {
+) -> Result<HashMap<String, Arc<PeptidePredictions>>> {
     if peptide_by_transcript.is_empty() {
         return Ok(HashMap::new());
     }
@@ -784,6 +786,8 @@ mod tests {
 
         let read = read_prediction_dumps(&peptides, dir.path()).unwrap();
         assert_eq!(read.len(), 3);
+        // The transcripts of one peptide share its one record.
+        assert!(Arc::ptr_eq(&read["first"], &read["second"]));
         let encoded = |matrix: &[u8]| base64::engine::general_purpose::STANDARD.encode(matrix);
         let held = format!("{:x}", md5::compute("MKV"));
         let fields = |matrix: &Option<PredictionBlob>| {
@@ -834,6 +838,6 @@ mod tests {
         write_database(unnamed.path(), "another_analysis");
         let read = read_prediction_dumps(&peptides, unnamed.path()).unwrap();
         assert_eq!(read.len(), 3);
-        assert!(read.values().all(without));
+        assert!(read.values().all(|matrices| without(matrices)));
     }
 }
