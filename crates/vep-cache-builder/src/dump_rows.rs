@@ -29,13 +29,19 @@ pub struct DumpRow<'a> {
     values: &'a [Vec<u8>],
     nulls: &'a [bool],
     /// The row's number in the file, from 1.
-    pub(crate) number: u64,
+    pub number: u64,
+    width: usize,
 }
 
 impl DumpRow<'_> {
     /// The value of the `nth` kept column, `None` for NULL.
     pub fn value(&self, nth: usize) -> Option<&[u8]> {
         (!self.nulls[nth]).then(|| self.values[nth].as_slice())
+    }
+
+    /// The number of columns the row holds, which may pass the schema's.
+    pub fn width(&self) -> usize {
+        self.width
     }
 }
 
@@ -170,6 +176,7 @@ pub fn read_rows_up_to(
                         values: &values,
                         nulls: &nulls,
                         number: row_number,
+                        width: column + 1,
                     })?;
                     for value in &mut values {
                         value.clear();
