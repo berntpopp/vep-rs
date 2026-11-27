@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Caches, reference FASTA and the cache tools
-  - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build.
+  - `vep-cache-builder --extended-promoters` files a promoter with `extended_start=0` in the first shard at start 0, as Ensembl VEP reads it, and a non-finite 1000 Genomes frequency is skipped instead of ending the build. (#136)
 
 ## [1.0.0] - 2026-11-24
 
