@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Transcript attributes, predictions and consequences
-  - `Amino_acids` translates a codon holding a byte outside the IUPAC alphabet as `X`, as BioPerl and the consequence terms read it, instead of as `N`.
+  - `Amino_acids` translates a codon holding a byte outside the IUPAC alphabet as `X`, as BioPerl and the consequence terms read it, instead of as `N`. (#158)
 
 ## [1.0.0] - 2026-11-24
 
