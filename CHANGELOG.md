@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Documentation, test corpora and comparison tools
-  - `vep-formats-compare` applies `merged_same_stable_id_collapse` to a row without `SOURCE` only where the rows carry `REFSEQ_MATCH`, so a run without `--refseq` or `--merged` stays red.
+  - `vep-formats-compare` applies `merged_same_stable_id_collapse` to a row without `SOURCE` only where the rows carry `REFSEQ_MATCH`, so a run without `--refseq` or `--merged` stays red. (#173)
 
 ## [1.0.0] - 2026-11-24
 
