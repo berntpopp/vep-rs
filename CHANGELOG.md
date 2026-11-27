@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Documentation, test corpora and comparison tools
   - `vep-formats-compare` applies `merged_same_stable_id_collapse` to a row without `SOURCE` only where the rows carry `REFSEQ_MATCH`, so a run without `--refseq` or `--merged` stays red.
+  - `hgvs_added_bases_left_at_the_span_end` in `vep-formats-compare` and `vep-plugin-pairs` reads a VCF or JSON row at its record's Location, so it sets aside those rows too.
 
 ## [1.0.0] - 2026-11-24
 
