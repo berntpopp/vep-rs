@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A run that skips many lines holds each numbered skip warning only for its own line and streams `--skipped_variants_file`, lowering peak memory 42 percent on 1,000,000 skipped synthetic records.
 - Output formats, columns and headers
   - The `--vcf` writer builds each `CSQ` entry in one buffer and `--json` builds each object once: 5 to 8 percent less CPU time on 50,000 1000 Genomes chr21 sites.
+- Command line, configuration and errors
+  - The refusal of an input whose format cannot be detected, a header-only VCF among them, names `--format`, and `--format vcf` for a VCF with no records.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 - Documentation, test corpora and comparison tools
