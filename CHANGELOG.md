@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Caches, reference FASTA and the cache tools
   - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads.
+- Input formats and records
+  - The streaming coordinator parses only lines holding a bracket or `CHR2` for breakend mates, and `--check_existing` bisects its windows; wall time unchanged within noise on 50,000 chr21 sites, 16 threads.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
