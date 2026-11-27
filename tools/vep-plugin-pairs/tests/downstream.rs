@@ -3429,4 +3429,36 @@ fn the_shift_an_earlier_allele_left_takes_the_codons_of_an_insertion_read_at_the
         let cased = [reference[0], reference[1], reference[2], upper.as_str()];
         assert_eq!(taken(cased), ["Amino_acids"], "{record}");
     }
+    // A two-base replacement prints the pair an insertion between its bases prints, and is
+    // no insertion: no window is read for it. The row name spells the record's alleles.
+    let row = |allele: &str, [cds, protein, amino_acids, codons]: Cells| {
+        default_row(
+            "21_1006_AA/CCC/CCCCCC",
+            "21:1006-1007",
+            allele,
+            TOY_FORWARD,
+            "inframe_insertion",
+            ["-", cds, protein, amino_acids, codons],
+            "IMPACT=MODERATE;STRAND=1;HGVS_OFFSET=4",
+        )
+    };
+    let first: Cells = [boundary_own[0], boundary_own[1], "-/X", "-/X"];
+    let reference = parsed(&[
+        row("CCC", first),
+        row("CCCCCC", ["10-11", "4", "L/PPL", "-/CCCCCCctt"]),
+    ]);
+    let candidate = parsed(&[row("CCC", first), row("CCCCCC", boundary_own)]);
+    let records = RecordRows::new(&reference, &["21\t1006\tw\tAA\tCCC,CCCCCC\t.\t.\t."]);
+    let rows = records.of(&reference[1]).expect("no refusal");
+    for name in ["Amino_acids", "Codons"] {
+        let taken = later_allele_shared_shift(
+            &reference[1],
+            &candidate[1],
+            name,
+            rows.as_deref(),
+            &sequences,
+        )
+        .expect("no refusal");
+        assert!(!taken, "{name}");
+    }
 }

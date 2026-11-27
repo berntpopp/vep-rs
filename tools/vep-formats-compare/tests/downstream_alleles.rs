@@ -1427,4 +1427,28 @@ fn hgvs_shift_shared_across_alleles_takes_the_codons_of_an_insertion_read_at_the
             "{record}"
         );
     }
+    // A two-base replacement prints the pair an insertion between its bases prints, and is
+    // no insertion: no window is read for it.
+    let (location, record) = ("21:1006-1007", "21\t1006\tw\tAA\tCCC,CCCCCC\t.\t.\t.");
+    let first = (boundary_own.0, boundary_own.1, "-/X", "-/X", "", "");
+    // The row name spells the record's alleles, as the input line does.
+    let text = |later: InsertionRow| {
+        default_text(&[
+            insertion_row(location, TOY_FORWARD, "1", "CCC", first, 4),
+            insertion_row(location, TOY_FORWARD, "1", "CCCCCC", later, 4),
+        ])
+        .replace("\nw\t", "\n21_1006_AA/CCC/CCCCCC\t")
+    };
+    let moved = ("10-11", "4", "L/PPL", "-/CCCCCCctt", "", "");
+    let (report, _) = compare_record(
+        &text(moved),
+        &text(boundary_own),
+        &side,
+        &[SHARED_SHIFT],
+        &[record],
+    );
+    assert_eq!(
+        (masked(&report, "Amino_acids"), masked(&report, "Codons")),
+        (BTreeMap::new(), BTreeMap::new())
+    );
 }
