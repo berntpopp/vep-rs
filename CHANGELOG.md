@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
+- Caches, reference FASTA and the cache tools
+  - `vep-cache-builder` reads the SIFT and PolyPhen matrix dump with the reader of every other table dump, so a row with a column past the third is read as its first three.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added

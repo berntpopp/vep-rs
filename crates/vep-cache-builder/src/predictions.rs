@@ -35,14 +35,12 @@
 //! cache and a native one read through one decoder.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use flate2::read::MultiGzDecoder;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts};
 use tracing::{debug, info, warn};
@@ -50,6 +48,7 @@ use tracing::{debug, info, warn};
 pub use crate::builder::{PeptidePredictions, PredictionBlob};
 use crate::core_dumps::{read_table, table_path};
 use crate::count::{counted, counted_as};
+use crate::dump_rows::read_rows_up_to;
 use crate::fasta::Peptide;
 
 /// Default Ensembl public MySQL host.
@@ -291,154 +290,26 @@ pub fn read_prediction_dumps(
 }
 
 /// Reads the dump of the matrices table at `path`, gzip when its name ends
-/// `.gz`: three columns a row, the MD5's identifier, the analysis's
-/// identifier and the matrix. `wanted` is asked once a row's two identifiers
-/// are read, and `matrix` is given each wanted row whose matrix is not NULL;
-/// the matrix of any other row is passed over without being kept. The values
-/// are read as bytes with the escapes `LOAD DATA` reads: a backslash before
-/// `0`, `b`, `n`, `r`, `t` or `Z` is that control byte, before any other byte
-/// that byte itself (a tab, a line end and a backslash inside a matrix are
-/// written so), and a value that is `\N` alone is NULL.
+/// `.gz`, through `read_rows_up_to`: three columns a row, the MD5's
+/// identifier, the analysis's identifier and the matrix. `wanted` is asked of
+/// each row whose two identifiers are not NULL, and `matrix` is given each
+/// wanted row whose matrix is not NULL.
 fn read_matrix_rows(
     path: &Path,
     wanted: impl Fn(&[u8], &[u8]) -> bool,
     mut matrix: impl FnMut(&[u8], &[u8], Vec<u8>),
 ) -> Result<()> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
-    let mut reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
-        Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::with_capacity(1 << 20, file))
-    };
-
-    // The row under way: its first two values, the matrix, and which column
-    // the next byte belongs to.
-    let mut ids: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
-    let mut blob: Vec<u8> = Vec::new();
-    let mut column = 0usize;
-    let mut keep = false;
-    // A value that so far is the NULL marker and nothing else.
-    let mut null = false;
-    let mut value_started = false;
-    let mut escaped = false;
-    let mut row_bytes = 0usize;
-    let mut row_number = 1u64;
-
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        if buffer.is_empty() {
-            break;
-        }
-        let read = buffer.len();
-        let mut at = 0;
-        while at < read {
-            // A run of plain bytes is taken whole.
-            let plain = if escaped {
-                0
-            } else {
-                buffer[at..]
-                    .iter()
-                    .position(|byte| matches!(byte, b'\\' | b'\t' | b'\n'))
-                    .unwrap_or(read - at)
-            };
-            if plain > 0 {
-                if null {
-                    // `\N` followed by more is the letter, not the marker.
-                    null = false;
-                    push_value(&mut ids, &mut blob, column, keep, b"N");
-                }
-                push_value(&mut ids, &mut blob, column, keep, &buffer[at..at + plain]);
-                value_started = true;
-                row_bytes += plain;
-                at += plain;
-                continue;
-            }
-            let byte = buffer[at];
-            at += 1;
-            row_bytes += 1;
-            if escaped {
-                escaped = false;
-                if byte == b'N' && !value_started {
-                    null = true;
-                } else {
-                    let decoded = match byte {
-                        b'0' => 0,
-                        b'b' => 8,
-                        b'n' => b'\n',
-                        b'r' => b'\r',
-                        b't' => b'\t',
-                        b'Z' => 26,
-                        other => other,
-                    };
-                    if null {
-                        null = false;
-                        push_value(&mut ids, &mut blob, column, keep, b"N");
-                    }
-                    push_value(&mut ids, &mut blob, column, keep, &[decoded]);
-                }
-                value_started = true;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else {
-                // The end of a value: a tab, or the row's line end.
-                let was_null = null;
-                null = false;
-                value_started = false;
-                if byte == b'\t' {
-                    column += 1;
-                    if column == 2 {
-                        keep = wanted(&ids[0], &ids[1]);
-                    }
-                } else {
-                    if column != 2 {
-                        bail!(
-                            "{} row {row_number} has {} columns, the schema has 3",
-                            path.display(),
-                            column + 1
-                        );
-                    }
-                    if keep && !was_null {
-                        matrix(&ids[0], &ids[1], std::mem::take(&mut blob));
-                    }
-                    ids[0].clear();
-                    ids[1].clear();
-                    blob.clear();
-                    column = 0;
-                    keep = false;
-                    row_bytes = 0;
-                    row_number += 1;
+    read_rows_up_to(path, 3, &[0, 1, 2], MAX_ROW_BYTES, |row| {
+        if let (Some(md5_id), Some(analysis_id)) = (row.value(0), row.value(1)) {
+            if wanted(md5_id, analysis_id) {
+                if let Some(blob) = row.value(2) {
+                    matrix(md5_id, analysis_id, blob.to_vec());
                 }
             }
         }
-        if row_bytes > MAX_ROW_BYTES {
-            bail!(
-                "{} row {row_number} is longer than the {MAX_ROW_BYTES}-byte limit for one row",
-                path.display()
-            );
-        }
-        reader.consume(read);
-    }
-    if column != 0 || value_started || escaped {
-        bail!(
-            "{} ends inside row {row_number}, which has no line end",
-            path.display()
-        );
-    }
+        Ok(())
+    })?;
     Ok(())
-}
-
-/// Adds `bytes` to the value of `column` in the row under way: an identifier
-/// always, the matrix only when the row is kept, and nothing past the third
-/// column.
-fn push_value(ids: &mut [Vec<u8>; 2], blob: &mut Vec<u8>, column: usize, keep: bool, bytes: &[u8]) {
-    match column {
-        0 | 1 => ids[column].extend_from_slice(bytes),
-        2 if keep => blob.extend_from_slice(bytes),
-        _ => {}
-    }
 }
 
 /// Resolve analysis_attrib_id values for sift, polyphen_humvar, polyphen_humdiv.
@@ -808,11 +679,11 @@ mod tests {
         assert!(rows[0].2 == matrix, "the matrix differs");
     }
 
-    /// A row of two columns or of four, and a file that ends inside a row,
-    /// after a value or after a backslash, are refused naming the file and
-    /// the row.
+    /// A row of two columns, and a file that ends inside a row, after a value
+    /// or after a backslash, are refused naming the file and the row. A row of
+    /// four columns is read as its first three, as every table dump is.
     #[test]
-    fn a_row_of_another_width_and_a_cut_file_are_refused_naming_the_row() {
+    fn a_short_row_and_a_cut_file_are_refused_naming_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let refusal = |dump: &[u8]| {
             let path = write_dump(dir.path(), "protein_function_predictions.txt", dump);
@@ -823,9 +694,14 @@ mod tests {
             refusal(b"1\t2\t\\0\n3\t4\n"),
             "<file> row 2 has 2 columns, the schema has 3"
         );
+        let wide = write_dump(
+            dir.path(),
+            "protein_function_predictions.txt",
+            b"1\t2\tab\tcd\n",
+        );
         assert_eq!(
-            refusal(b"1\t2\tab\tcd\n"),
-            "<file> row 1 has 4 columns, the schema has 3"
+            matrix_rows(&wide).unwrap().0,
+            [(b"1".to_vec(), b"2".to_vec(), b"ab".to_vec())]
         );
         for cut in [
             &b"1\t2\tab\n3\t4\tcd"[..],
