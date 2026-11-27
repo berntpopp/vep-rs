@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Documentation, test corpora and comparison tools
   - `hgvs_shift_shared_across_alleles` in `vep-formats-compare` and `vep-plugin-pairs` takes a later in-frame insertion allele's `Codons` and `Amino_acids` as Ensembl VEP reads them at the moved pair.
+  - `vep-formats-compare` takes `shifted_allele_rotation_by_strand` HGVSp pairs from the rows alone, and `hgvs_shift_shared_across_alleles` a later allele's `Consequence` and `HGVSp` read at the first allele's shifted pair.
 
 ## [1.0.0] - 2026-11-24
 

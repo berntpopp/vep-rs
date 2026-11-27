@@ -36,6 +36,10 @@ tests = ["crates/vep-cli/tests/consequence_documented_rows.rs::a_later_insertion
 rules = [
     "tools/vep-formats-compare/src/rules/downstream.rs::inserted_window",
     "tools/vep-formats-compare/src/rules/downstream.rs::later_allele_shared_shift",
+    "tools/vep-formats-compare/src/rules/downstream.rs::inserted_peptide_term",
+    "tools/vep-formats-compare/src/rules/downstream.rs::later_allele_terms_or_notation",
     "tools/vep-plugin-pairs/src/rules/downstream/classes.rs::inserted_window",
+    "tools/vep-plugin-pairs/src/rules/downstream/classes.rs::inserted_peptide_term",
     "tools/vep-plugin-pairs/src/rules/downstream/classes.rs::later_allele_shared_shift",
+    "tools/vep-plugin-pairs/src/rules/downstream/classes.rs::later_allele_terms_or_notation",
 ]
