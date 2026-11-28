@@ -295,6 +295,12 @@ fn is_perl_whitespace(c: char) -> bool {
 /// it ([`fields::percent_encode_control_bytes`]).
 fn vcf_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
+    vcf_encode_into(&mut out, value);
+    out
+}
+
+/// [`vcf_encode`] appended to `out`.
+fn vcf_encode_into(out: &mut String, value: &str) {
     let mut in_whitespace = false;
     for ch in value.chars() {
         let whitespace = is_perl_whitespace(ch);
@@ -314,16 +320,6 @@ fn vcf_encode(value: &str) -> String {
         }
         in_whitespace = whitespace;
     }
-    out
-}
-
-pub(crate) fn value_for_field(
-    field: &str,
-    variant: &InputVariant,
-    tc: Option<&TranscriptConsequence>,
-    options: &FieldOptions,
-) -> String {
-    fields::field_value(field, variant, tc, options, "&")
 }
 
 /// One CSQ entry. A gene symbol's whitespace is percent-encoded before the
@@ -340,26 +336,31 @@ fn format_csq_entry(
     tc: Option<&TranscriptConsequence>,
     options: &FieldOptions,
 ) -> String {
-    fields
-        .iter()
-        .zip(produced)
-        .map(|(field, produced)| {
-            if !produced {
-                return String::new();
-            }
-            let v = value_for_field(field, variant, tc, options);
-            if v == "-" && field != "Allele" {
-                String::new()
-            } else if field == "Allele" && variant.strand.as_i8() < 0 {
-                vcf_encode(&String::from_utf8_lossy(&reverse_complement(v.as_bytes())))
-            } else if field == "SYMBOL" && !options.no_escape {
-                vcf_encode(&v.replace(is_perl_whitespace, "%20"))
-            } else {
-                vcf_encode(&v)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+    let mut entry = String::new();
+    let mut bytes = Vec::new();
+    for (i, (field, produced)) in fields.iter().zip(produced).enumerate() {
+        if i > 0 {
+            entry.push('|');
+        }
+        if !produced {
+            continue;
+        }
+        bytes.clear();
+        fields::write_field_value(&mut bytes, field, variant, tc, options, "&");
+        let v = String::from_utf8_lossy(&bytes);
+        if v == "-" && field != "Allele" {
+            continue;
+        }
+        if field == "Allele" && variant.strand.as_i8() < 0 {
+            let reversed = reverse_complement(v.as_bytes());
+            vcf_encode_into(&mut entry, &String::from_utf8_lossy(&reversed));
+        } else if field == "SYMBOL" && !options.no_escape {
+            vcf_encode_into(&mut entry, &v.replace(is_perl_whitespace, "%20"));
+        } else {
+            vcf_encode_into(&mut entry, &v);
+        }
+    }
+    entry
 }
 
 /// Whether `allele` is one or more of the bases `A`, `C`, `G`, `T`, `N`

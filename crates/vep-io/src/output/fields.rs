@@ -3583,15 +3583,25 @@ pub(crate) fn plugin_value<'a>(
     tc: Option<&'a TranscriptConsequence>,
     options: &FieldOptions,
 ) -> Option<&'a str> {
-    if let Some(row_value) = tc.and_then(|x| x.plugin_data.get(field)) {
+    if let Some(row_value) = tc.and_then(|x| plugin_map_value(&x.plugin_data, field)) {
         return Some(row_value.as_str());
     }
     if tc.is_none() && variant.summary_terms.is_some() {
         return None;
     }
-    let variant_value = variant.plugin_data.get(field)?;
+    let variant_value = plugin_map_value(&variant.plugin_data, field)?;
     let kind = RowKind::of_row(tc.map(|x| x.feature_type));
     variant_plugin_value_prints_on(field, variant, kind, options).then_some(variant_value.as_str())
+}
+
+/// The value `map` holds under `key`. A map of a few keys is scanned, which
+/// costs less than hashing `key`, since every field of every row is looked up.
+fn plugin_map_value<'a>(map: &'a IndexMap<String, String>, key: &str) -> Option<&'a String> {
+    if map.len() <= 16 {
+        map.iter().find_map(|(k, v)| (k == key).then_some(v))
+    } else {
+        map.get(key)
+    }
 }
 
 /// Whether a value a plugin wrote for the whole variant prints on a row of
@@ -6502,6 +6512,27 @@ mod tests {
             ""
         );
         assert!(!extra_keys(&breakpoint, Some(&motif), &options).contains(&"OverlapBP"));
+    }
+
+    /// A plugin map is read alike by the scan of a few keys and by the lookup
+    /// of a larger map.
+    #[test]
+    fn plugin_values_are_read_from_a_map_of_any_size() {
+        for size in [1, 16, 17, 40] {
+            let mut variant =
+                InputVariant::new("21".into(), 1_005, 1_005, b"A".to_vec(), b"G".to_vec());
+            for i in 0..size {
+                variant.plugin_data.insert(format!("P{i}"), format!("v{i}"));
+            }
+            let options = FieldOptions::default();
+            for i in 0..size {
+                let key = format!("P{i}");
+                let value = format!("v{i}");
+                assert_eq!(plugin_value(&key, &variant, None, &options), Some(value.as_str()));
+            }
+            assert_eq!(plugin_value("P", &variant, None, &options), None);
+            assert_eq!(plugin_value("Absent", &variant, None, &options), None);
+        }
     }
 
     /// A value a plugin wrote for the whole variant prints on the rows of the
