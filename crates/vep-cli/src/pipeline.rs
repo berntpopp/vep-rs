@@ -164,7 +164,7 @@ use vep_io::output::vcf_output::VcfOutputFormatter;
 /// Batches a stage may hold ahead of the next one.
 pub(crate) const PIPELINE_DEPTH: usize = 2;
 
-/// Input records rendered per rayon task.
+/// Most input records in one rayon task.
 const RENDER_CHUNK_RECORDS: usize = 64;
 
 /// Smallest fused task, in units. A fused task carries a record's annotation as
@@ -174,10 +174,11 @@ const RENDER_CHUNK_RECORDS: usize = 64;
 /// [`RENDER_CHUNK_RECORDS`].
 const FUSED_CHUNK_MIN_RECORDS: usize = 8;
 
-/// Fused tasks per pool thread per batch; the tail a worker idles at the
-/// barrier is about one task long, so more tasks per worker means a shorter
-/// idle tail at the cost of smaller output buffers.
-const FUSED_TASKS_PER_WORKER: usize = 6;
+/// Tasks per pool thread per batch; the tail a worker idles at the barrier is
+/// about one task long, so more tasks per worker means a shorter idle tail at
+/// the cost of smaller output buffers. At 32, a 5,000-record batch on 16
+/// threads runs tasks of 9 records.
+const FUSED_TASKS_PER_WORKER: usize = 32;
 
 /// One line of a [`LineBatch`] as the reader classified it.
 enum Item {
@@ -1161,8 +1162,7 @@ pub(crate) struct Coordinator<'a> {
     /// `--pipeline_depth`, resolved: batches a stage may hold ahead of the next.
     pub depth: usize,
     /// `--render_task_records`, resolved: units per pool task, or `None` for the
-    /// built-in sizing ([`fused_chunk_units`], or [`RENDER_CHUNK_RECORDS`] on the
-    /// plugin path).
+    /// built-in sizing ([`fused_chunk_units`]), on the plugin path's render too.
     pub task_records: Option<usize>,
 }
 
@@ -3466,12 +3466,14 @@ fn written_allele_of_hom_ref_copy(record: &[InputVariant]) -> Option<InputVarian
 fn fused_chunk_units(units: usize, c: &Coordinator<'_>) -> usize {
     match c.task_records {
         Some(records) => records.max(1),
-        None => {
-            let workers = c.pool.current_num_threads().max(1);
-            (units / (workers * FUSED_TASKS_PER_WORKER))
-                .clamp(FUSED_CHUNK_MIN_RECORDS, RENDER_CHUNK_RECORDS)
-        }
+        None => built_in_chunk_units(units, c.pool.current_num_threads()),
     }
+}
+
+/// The built-in units per task for a batch of `units` on `workers` threads.
+fn built_in_chunk_units(units: usize, workers: usize) -> usize {
+    (units / (workers.max(1) * FUSED_TASKS_PER_WORKER))
+        .clamp(FUSED_CHUNK_MIN_RECORDS, RENDER_CHUNK_RECORDS)
 }
 
 /// The end, in the batch's variants, of the last record among `units`, or
@@ -3637,8 +3639,8 @@ fn unit_chunks<'b>(
     tasks
 }
 
-/// Renders an annotated batch into one chunk per [`RENDER_CHUNK_RECORDS`]
-/// units, or per `--render_task_records` when set, each task freeing its
+/// Renders an annotated batch into one chunk per [`fused_chunk_units`] units,
+/// the size a fused task takes, each task freeing its
 /// records once they are rendered, on the thread that renders them, as a
 /// [`fused_task`] does: the consequences are the bulk of a batch's allocations
 /// and were made on the pool's threads, and freeing them there keeps each
@@ -3659,7 +3661,7 @@ fn render_batch(
     } = batch;
     let ctx = c.write_ctx;
     let reserve = spare.chunk_reserve;
-    let chunk_units = c.task_records.unwrap_or(RENDER_CHUNK_RECORDS).max(1);
+    let chunk_units = fused_chunk_units(units.len(), c);
     let rows_rendered = fills_rows(ctx);
     let tasks = unit_chunks(units, variants, chunk_units);
     let text: &Vec<u8> = text;
@@ -4579,6 +4581,16 @@ mod tests {
     use super::*;
     use crate::vcf_parser::{parse_vcf_line, RecordInfo};
     use std::io::{BufReader, Cursor};
+
+    /// A 5,000-record batch on 16 threads runs tasks of 9 records; a small
+    /// batch keeps the floor and a lone thread the ceiling.
+    #[test]
+    fn built_in_tasks_keep_every_worker_busy_to_the_batch_end() {
+        assert_eq!(built_in_chunk_units(5000, 16), 9);
+        assert_eq!(built_in_chunk_units(100, 16), FUSED_CHUNK_MIN_RECORDS);
+        assert_eq!(built_in_chunk_units(5000, 1), RENDER_CHUNK_RECORDS);
+        assert_eq!(built_in_chunk_units(5000, 0), RENDER_CHUNK_RECORDS);
+    }
 
     /// Which parser refusals the `--chr` list silences: every refusal of an
     /// Ensembl-format line; a skipped SPDI line unless its text opens with
