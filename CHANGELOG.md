@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file. (#156)
   - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store. (#142)
 - Caches, reference FASTA and the cache tools
+  - Two prewarm loads run at once, one merging while the next parses: 31 percent less wall time on a 46,757-variant exome (7 percent from a cold page cache), 16 threads.
   - Each batch loads only the transcript shards its sequence records reach, and chromosomes the input left are released: 24 SNVs on 24 chromosomes peak at 0.80 GB, not 8.27 GB. (#187)
   - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads. (#139)
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged. (#184)
