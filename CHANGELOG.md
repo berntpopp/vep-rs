@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Plugins
-  - `gnomADc` writes a batch's coverage means for its variants side by side on the run's threads: 15 percent less wall time on whole-genome ClinVar, 16 threads.
+  - `gnomADc` writes a batch's coverage means for its variants side by side on the run's threads: with the windowed tabix reads of #140, 8 percent less wall time on whole-genome ClinVar, 16 threads; no change without them.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
