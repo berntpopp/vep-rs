@@ -149,15 +149,14 @@ impl<R: BufRead> RegionParser<R> {
         let mut variant = if sequence {
             let reference = if start <= end {
                 let mut reference = Vec::new();
-                usize::try_from(end - start + 1)
-                    .ok()
-                    .filter(|&n| reference.try_reserve_exact(n).is_ok())
-                    .map(|n| reference.resize(n, b'N'))
-                    .ok_or_else(|| {
-                        IoError::Unsupported(format!(
+                match usize::try_from(end - start + 1) {
+                    Ok(n) if reference.try_reserve_exact(n).is_ok() => reference.resize(n, b'N'),
+                    _ => {
+                        return Err(IoError::Unsupported(format!(
                             "variant size ({span}) cannot be held in memory"
-                        ))
-                    })?;
+                        )))
+                    }
+                }
                 reference
             } else {
                 b"-".to_vec()
@@ -624,16 +623,6 @@ mod tests {
         assert!(parser.next_variant().is_none());
     }
 
-    /// `validate_vf`'s size test (Parser.pm:491-500) runs before the run of `N`
-    /// is built, so an oversize span, one no memory could hold included, costs
-    /// nothing and is refused with Ensembl VEP's text, a structural word too,
-    /// and the lines after it are still read; an insertion's span is below
-    /// zero and passes; no limit is applied for the flag's `-1`. A class word
-    /// the table lacks is refused first, as `get_SO_term` refuses it while the
-    /// feature is built (Parser/Region.pm:205-206), whatever its span. The span
-    /// is the minimised record's: `21:1-1002/N` shares its first `N` with the
-    /// run, so `minimise_alleles` leaves `N` x 1001 over 2 to 1002 and the span
-    /// 1000 passes where `21:1-1002/G` is refused.
     /// Under `--max_sv_size -1` a span no allocation can hold ends the run with
     /// the input's refusal, as Ensembl VEP dies building its `'N' x` reference
     /// (Parser/Region.pm:189), instead of aborting the process.
@@ -647,6 +636,16 @@ mod tests {
         );
     }
 
+    /// `validate_vf`'s size test (Parser.pm:491-500) runs before the run of `N`
+    /// is built, so an oversize span, one no memory could hold included, costs
+    /// nothing and is refused with Ensembl VEP's text, a structural word too,
+    /// and the lines after it are still read; an insertion's span is below
+    /// zero and passes; no limit is applied for the flag's `-1`. A class word
+    /// the table lacks is refused first, as `get_SO_term` refuses it while the
+    /// feature is built (Parser/Region.pm:205-206), whatever its span. The span
+    /// is the minimised record's: `21:1-1002/N` shares its first `N` with the
+    /// run, so `minimise_alleles` leaves `N` x 1001 over 2 to 1002 and the span
+    /// 1000 passes where `21:1-1002/G` is refused.
     #[test]
     fn oversize_span_refused_before_the_reference_is_built() {
         let context = ParserContext {
