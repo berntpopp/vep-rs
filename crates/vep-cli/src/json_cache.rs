@@ -1494,18 +1494,15 @@ pub(crate) fn read_shard(path: &Path, manifest: &CacheManifest) -> anyhow::Resul
 }
 
 /// The first gzip member of `raw`, inflated in one libdeflate call as flate2's
-/// `GzDecoder` reads it; `None` where libdeflate refuses the buffer, or where
-/// the header carries a CRC (FHCRC), which flate2 checks and libdeflate skips.
+/// `GzDecoder` reads it; `None` where libdeflate refuses the buffer or flate2
+/// refuses its header, whose CRC and field lengths libdeflate does not check.
 fn gunzip_whole(raw: &[u8]) -> Option<Vec<u8>> {
-    const FHCRC: u8 = 0x02;
-    if raw.get(3).is_none_or(|flags| flags & FHCRC != 0) {
-        return None;
-    }
+    flate2::bufread::GzDecoder::new(raw).header()?;
     // DEFLATE expands at most 1032-fold; ISIZE, the last member's length
-    // mod 2^32, is only the first guess.
+    // mod 2^32, is only a first guess, held to 32-fold against a bogus one.
     let limit = raw.len().saturating_mul(1032);
     let isize = u32::from_le_bytes(raw.last_chunk::<4>()?.to_owned()) as usize;
-    let mut size = isize.min(limit);
+    let mut size = isize.min(raw.len().saturating_mul(32));
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut out = vec![0; size];
@@ -2441,7 +2438,7 @@ mod tests {
     /// Gzip shapes a `.json.gz` shard can take: one member, two members, a
     /// last member whose ISIZE understates the first, an empty payload, and the
     /// broken ones (empty file, header only, truncated, bad CRC, a wrong header
-    /// CRC under FHCRC, trailing garbage).
+    /// CRC under FHCRC, a file name longer than flate2 reads, trailing garbage).
     fn gzip_fixtures() -> Vec<(&'static str, Vec<u8>)> {
         let gz = |data: &[u8]| {
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -2455,12 +2452,23 @@ mod tests {
         let mut bad_crc = one.clone();
         let at = bad_crc.len() - 8;
         bad_crc[at] ^= 0xff;
+        let named = |name: &[u8]| {
+            let mut out = one[..10].to_vec();
+            out[3] |= 0x08;
+            out.extend_from_slice(name);
+            out.push(0);
+            out.extend_from_slice(&one[10..]);
+            out
+        };
         let mut fhcrc = one[..10].to_vec();
         fhcrc[3] |= 0x02;
         fhcrc.extend_from_slice(&[0xde, 0xad]);
         fhcrc.extend_from_slice(&one[10..]);
         vec![
             ("one member", one.clone()),
+            ("file name", named(b"1-1000000.json")),
+            ("longest file name", named(&[b'n'; 65535])),
+            ("overlong file name", named(&[b'n'; 65536])),
             ("two members", [gz(b"[1,"), gz(b"2]")].concat()),
             ("understated ISIZE", [one.clone(), gz(b"x")].concat()),
             ("empty payload", gz(b"")),
@@ -2509,8 +2517,8 @@ mod tests {
             .map(|_| reference);
             let fast = gunzip_whole(&raw);
             match name {
-                "one member" | "two members" | "understated ISIZE" | "empty payload"
-                | "trailing garbage" => {
+                "one member" | "file name" | "longest file name" | "two members"
+                | "understated ISIZE" | "empty payload" | "trailing garbage" => {
                     assert_eq!(fast, Some(reference.unwrap()), "{name}")
                 }
                 _ => assert_eq!(fast, None, "{name}"),
