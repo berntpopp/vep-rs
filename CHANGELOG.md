@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `vep-cache-converter convert-plugin-data` writes a sorted table's rows straight into the store and reads and hashes on worker threads: whole-genome CADD in 27 minutes against 127, Broadwell.
 - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store. (#142)
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
