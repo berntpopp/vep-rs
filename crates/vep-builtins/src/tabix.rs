@@ -1011,15 +1011,23 @@ impl TabixAnnotator {
                 Err(_) => return self.query_windows(chr, windows),
             }
         }
+        let spans = merge_chunks(&chunks);
+        let read = |&(span_start, span_end): &(bgzf::VirtualPosition, bgzf::VirtualPosition)| {
+            self.span_records_by_block(span_start, span_end, slice_bytes, windows, file_chr)
+        };
+        // The spans shorter than a slice are read side by side, so a batch of
+        // scattered windows waits on many reads at once rather than one after
+        // another; a longer span holds a slice at a time and is read in turn.
+        let short: Vec<Option<_>> = spans
+            .par_iter()
+            .map(|span| {
+                let length = span.1.compressed().saturating_sub(span.0.compressed());
+                (length < slice_bytes as u64).then(|| read(span))
+            })
+            .collect();
         let mut records = Vec::new();
-        for (span_start, span_end) in merge_chunks(&chunks) {
-            match self.span_records_by_block(
-                span_start,
-                span_end,
-                slice_bytes,
-                windows,
-                file_chr,
-            )? {
+        for (span, found) in spans.iter().zip(short) {
+            match found.unwrap_or_else(|| read(span))? {
                 Some(found) => records.extend(found),
                 None => return self.query_windows(chr, windows),
             }
@@ -1062,7 +1070,11 @@ impl TabixAnnotator {
         if end_block > file_len || start_block > end_block {
             return Err(not_a_block(end_block));
         }
-        let mut blocks = BlockReader::new(file, start_block).map_err(|e| self.read_error(e))?;
+        // The span's bytes, its end block and the block past it, at most 64 KiB
+        // each, are all the read needs.
+        let reach = usize::try_from(end_block - start_block).unwrap_or(usize::MAX);
+        let mut blocks = BlockReader::new(file, start_block, reach.saturating_add(1 << 17))
+            .map_err(|e| self.read_error(e))?;
         // A span whose last line ends with a block ends at the byte past it, so
         // the end block then holds none of the span's bytes and may be missing
         // (a file with no EOF block) or cut short.
@@ -1423,7 +1435,7 @@ impl TabixAnnotator {
         let Ok(file) = std::fs::File::open(&self.config.file_path) else {
             return false;
         };
-        let Ok(mut blocks) = BlockReader::new(file, from) else {
+        let Ok(mut blocks) = BlockReader::new(file, from, 1 << 20) else {
             return false;
         };
         while blocks.offset() < to {
@@ -1706,9 +1718,11 @@ struct BlockReader {
 }
 
 impl BlockReader {
-    fn new(file: std::fs::File, offset: u64) -> std::io::Result<Self> {
+    /// A reader from the block at `offset` that reads the file ahead in at
+    /// most `reach` bytes, and at most 1 MiB, at a time.
+    fn new(file: std::fs::File, offset: u64, reach: usize) -> std::io::Result<Self> {
         use std::io::{Seek, SeekFrom};
-        let mut reader = BufReader::with_capacity(1 << 20, file);
+        let mut reader = BufReader::with_capacity(reach.min(1 << 20), file);
         reader.seek(SeekFrom::Start(offset))?;
         Ok(Self { reader, offset })
     }
@@ -5070,9 +5084,10 @@ mod tests {
         );
     }
 
-    /// A span read in slices of one block answers as the one-slice read and the
-    /// line-by-line read do: every line that crosses a slice boundary is made
-    /// whole from the block that opens the next slice and scanned once.
+    /// A span read in slices of one block answers as the one-slice read, the
+    /// side-by-side read of short spans and the line-by-line read do: every
+    /// line that crosses a slice boundary is made whole from the block that
+    /// opens the next slice and scanned once.
     #[test]
     fn query_windows_parallel_reads_a_span_in_slices_of_one_block() {
         let dir = tempfile::tempdir().unwrap();
@@ -5090,14 +5105,17 @@ mod tests {
         ] {
             let by_sweep = lines(&ann.query_windows("21", &windows).unwrap());
             assert!(by_sweep.len() >= 4, "{by_sweep:?}");
-            assert_eq!(
-                lines(&ann.query_windows_in_slices("21", &windows, 1).unwrap()),
-                by_sweep
-            );
-            assert_eq!(
-                lines(&ann.query_windows_parallel("21", &windows).unwrap()),
-                by_sweep
-            );
+            // A slice of one byte reads every span in turn, the others side by
+            // side.
+            for slice_bytes in [1, SLICE_BYTES, usize::MAX] {
+                assert_eq!(
+                    lines(
+                        &ann.query_windows_in_slices("21", &windows, slice_bytes)
+                            .unwrap()
+                    ),
+                    by_sweep
+                );
+            }
         }
     }
 
