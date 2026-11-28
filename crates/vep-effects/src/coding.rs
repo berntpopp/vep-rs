@@ -2725,6 +2725,9 @@ enum EditedStopCodon {
 }
 
 /// One `TranscriptVariationAllele` evaluation with Ensembl VEP's `_predicate_cache`.
+/// The span an alternate translation was read at and the translation.
+type AltTranslationMemo = std::cell::RefCell<Option<((Option<i64>, Option<i64>), Option<Vec<u8>>)>>;
+
 struct PerlCodingEval<'a> {
     transcript: &'a Transcript,
     cds: &'a [u8],
@@ -2792,6 +2795,9 @@ struct PerlCodingEval<'a> {
     /// Whether that peptide is read on a row whose stop codon the stop codon
     /// test finds kept ([`Self::keeps_a_stop_codon_before_unknown_bases`]).
     reads_a_kept_stop_codon: bool,
+    /// The translation of [`Self::alternate_cds`] for the span it was read at,
+    /// `(cds_start, cds_end)`: the protein-notation paths read it several times.
+    alt_translation_memo: AltTranslationMemo,
 }
 
 impl<'a> PerlCodingEval<'a> {
@@ -2842,6 +2848,22 @@ impl<'a> PerlCodingEval<'a> {
             alt.extend_from_slice(utr);
         }
         Some(alt)
+    }
+
+    /// `perl_translate` of [`Self::alternate_cds`] under the transcript's table,
+    /// translated once for each span the evaluation is read at.
+    fn alternate_translation(&self) -> Option<Vec<u8>> {
+        let key = (self.span.cds_start, self.span.cds_end);
+        if let Some((at, translation)) = self.alt_translation_memo.borrow().as_ref() {
+            if *at == key {
+                return translation.clone();
+            }
+        }
+        let translation = self
+            .alternate_cds()
+            .map(|cds| perl_translate(&cds, self.table));
+        *self.alt_translation_memo.borrow_mut() = Some((key, translation.clone()));
+        translation
     }
 
     /// `TranscriptVariationAllele::codon`. `Some(b"-")` is Ensembl VEP's `'-'`.
@@ -5549,7 +5571,7 @@ fn hgvsp_fs_peptides(
     {
         return None;
     }
-    let alt_trans = perl_translate(&alt_cds, ev.table);
+    let alt_trans = ev.alternate_translation()?;
     let mut ref_trans = ev.pep_seq.to_vec();
     ref_trans.push(b'*');
     let standard_code_differs_at_one = || {
@@ -5653,8 +5675,7 @@ fn hgvsp_stop_loss_extra_aa(ev: &PerlCodingEval<'_>, ref_var_pos: i64, fs: bool)
     if ref_var_pos == 0 {
         return None;
     }
-    let alt_cds = ev.alternate_cds()?;
-    let alt_trans = perl_translate(&alt_cds, ev.table);
+    let alt_trans = ev.alternate_translation()?;
     let stop_end = alt_trans.iter().position(|&b| b == b'*')? as i64 + 1;
     let extra = if fs {
         stop_end - ref_var_pos
@@ -5687,7 +5708,7 @@ fn hgvsp_frameshift_count_from_residue_1(
     if first_changed != 1 || ev.start_codon_stands {
         return None;
     }
-    let alt_trans = perl_translate(&ev.alternate_cds()?, ev.table);
+    let alt_trans = ev.alternate_translation()?;
     let stop = alt_trans.iter().position(|&b| b == b'*')?;
     Some(stop as i64 + 1)
 }
@@ -5697,10 +5718,9 @@ fn hgvsp_frameshift_count_from_residue_1(
 /// side, translated under the transcript's table, cut at its first stop), clipped,
 /// three-lettered.
 fn hgvsp_del_peptides(ev: &PerlCodingEval<'_>, n: &mut HgvsProteinNotation) -> Option<()> {
-    let alt_cds = ev.alternate_cds()?;
     let tl_start = truthy(ev.span.tl_start)?;
     let start0 = ((tl_start - 1).max(0)) as usize;
-    let alt_trans = perl_translate(&alt_cds, ev.table);
+    let alt_trans = ev.alternate_translation()?;
     let alt_tail = alt_trans.get(start0..).unwrap_or(b"");
     let alt: Vec<u8> = alt_tail
         .split(|&b| b == b'*')
@@ -5895,7 +5915,7 @@ impl PerlCodingEval<'_> {
         if first > stop_codon || last <= stop_codon || !(whole_stop_codon || out_of_frame) {
             return None;
         }
-        let alternate = perl_translate(&self.alternate_cds()?, self.table);
+        let alternate = self.alternate_translation()?;
         let same = alternate
             .iter()
             .zip(self.pep_seq.iter())
@@ -6040,7 +6060,7 @@ impl PerlCodingEval<'_> {
         if !fits || !(held || closing) {
             return None;
         }
-        let alternate = perl_translate(&self.alternate_cds()?, self.table);
+        let alternate = self.alternate_translation()?;
         if alternate.get(..at)? != &reference[..at] || alternate.get(at)? == &b'*' {
             return None;
         }
@@ -6086,7 +6106,7 @@ impl PerlCodingEval<'_> {
         let fits = (0..residues).all(|residue| {
             reference[residue] == self.pep_seq[residue] || (residue == 0 && self.pep_seq[0] == b'M')
         });
-        let alternate = perl_translate(&self.alternate_cds()?, self.table);
+        let alternate = self.alternate_translation()?;
         let first = alternate
             .iter()
             .zip(&reference)
@@ -6198,7 +6218,7 @@ impl PerlCodingEval<'_> {
         if !fits || !(held || closing) {
             return None;
         }
-        let alternate = perl_translate(&self.alternate_cds()?, self.table);
+        let alternate = self.alternate_translation()?;
         if alternate.get(..at)? != &reference[..at] || alternate.get(at)? == &b'*' {
             return None;
         }
@@ -6220,7 +6240,7 @@ impl PerlCodingEval<'_> {
     fn stop_codon_change(&self) -> Option<StopCodonChange> {
         let residues = self.pep_seq.len();
         let (cds_start, cds_end) = self.span_where_the_proteins_compare()?;
-        let alternate = perl_translate(&self.alternate_cds()?, self.table);
+        let alternate = self.alternate_translation()?;
         let tail = alternate.strip_prefix(&self.pep_seq[..])?;
         let first = *tail.first()?;
         let added = tail.iter().position(|&aa| aa == b'*');
@@ -6731,6 +6751,7 @@ impl<'a> PerlCodingEval<'a> {
             stop_gained_memo: None,
             reads_unknown_bases: false,
             reads_a_kept_stop_codon: false,
+            alt_translation_memo: std::cell::RefCell::new(None),
         })
     }
 
