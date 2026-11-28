@@ -1672,11 +1672,7 @@ impl LazyTranscriptIndexes {
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
         if !held.kept && held.index.is_some() {
-            // Freeing a chromosome's transcripts takes tens of milliseconds,
-            // which the batch coordinator calling this does not wait for.
-            if let Some(index) = held.index.take() {
-                rayon::spawn(move || drop(index));
-            }
+            held.index = None;
             held.window = None;
             held.released = true;
         }
