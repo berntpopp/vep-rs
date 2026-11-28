@@ -58,6 +58,8 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use tracing::debug;
 use vep_core::allele_trim::CaseRule;
 use vep_core::assembly::Assembly;
@@ -502,13 +504,18 @@ impl BuiltinPlugin for AlphaMissensePlugin {
         if batch.is_empty() {
             return Ok(());
         }
-        for variant in variants.iter_mut().filter(|v| !v.is_structural) {
+        // A variant's rows read the batch's records alone, so the variants run
+        // side by side on the run's pool.
+        variants.par_iter_mut().for_each(|variant| {
+            if variant.is_structural {
+                return;
+            }
             // The records come first: most variants of a genome-wide input lie
             // outside the file's coding positions and are done at the lookup,
             // before any of their rows is read.
             let records = self.matching_records(&batch, variant);
             if records.is_empty() {
-                continue;
+                return;
             }
             for row in &mut variant.transcript_consequences {
                 if !self.annotates_row(row) || !Self::is_missense(row) {
@@ -534,7 +541,7 @@ impl BuiltinPlugin for AlphaMissensePlugin {
                     }
                 }
             }
-        }
+        });
         Ok(())
     }
 
@@ -1067,6 +1074,47 @@ mod tests {
                     assert_eq!(written, own_prediction(alt), "table {name}, allele {alt}");
                 }
             }
+        }
+    }
+
+    /// A batch annotated side by side on a pool gives each variant the fields
+    /// a batch of that variant alone gives it.
+    #[test]
+    fn a_batch_side_by_side_writes_each_variant_as_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            "chr21\t13610388\tA\tC\thg38\tQ86YR6\tENST00000299443.5\tM54L\t0.1079\tlikely_benign",
+            "chr21\t13610388\tA\tT\thg38\tQ86YR6\tENST00000299443.5\tM54L\t0.9000\tlikely_pathogenic",
+        ];
+        let plugin = loaded(&[format!("file={}", fixture(dir.path(), "am.tsv.gz", &rows))]);
+        let alts = ["C", "T", "G"];
+        let allele = |alt: &str| {
+            let mut v = snv(13610388, b"A", alt.as_bytes());
+            v.transcript_consequences.push(row(
+                "ENST00000299443",
+                Consequence::MissenseVariant,
+                "M/L",
+            ));
+            v
+        };
+        let mut variants: Vec<InputVariant> = (0..300).map(|i| allele(alts[i % 3])).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| plugin.run_batch(&mut variants)).unwrap();
+        for (i, variant) in variants.iter().enumerate() {
+            let written: Vec<Vec<String>> = variant
+                .transcript_consequences
+                .iter()
+                .map(|tc| {
+                    tc.plugin_data
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(written, fields(&plugin, allele(alts[i % 3])), "variant {i}");
         }
     }
 
