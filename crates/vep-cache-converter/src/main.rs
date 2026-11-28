@@ -882,6 +882,8 @@ struct Spans {
     last: Option<(usize, u64)>,
     /// The chromosomes' names, in the order each was first read.
     names: Vec<String>,
+    /// A chromosome's place in `names`, by its name.
+    numbers: std::collections::HashMap<String, usize>,
     /// The kept rows: the number of the start, the chromosome, the start
     /// and the end.
     kept: Vec<(u64, usize, u64, u64)>,
@@ -895,6 +897,7 @@ impl Spans {
             starts: 0,
             last: None,
             names: Vec::new(),
+            numbers: std::collections::HashMap::new(),
             kept: Vec::new(),
         }
     }
@@ -903,10 +906,11 @@ impl Spans {
     fn record(&mut self, chr: &str, start: u64, end: u64) {
         let number = match self.last {
             Some((number, _)) if self.names[number] == chr => number,
-            _ => match self.names.iter().position(|name| name == chr) {
-                Some(number) => number,
+            _ => match self.numbers.get(chr) {
+                Some(&number) => number,
                 None => {
                     self.names.push(chr.to_string());
+                    self.numbers.insert(chr.to_string(), self.names.len() - 1);
                     self.names.len() - 1
                 }
             },
