@@ -30,7 +30,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::Seek;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -48,7 +48,7 @@ use vep_builtins::PluginError;
 use vep_cli::regulatory::{count_shard_features, BindingMatrices};
 use vep_core::cache_info::left_out::SEQ_EDITS;
 use vep_core::cache_info::REGULATORY_SCHEMA;
-use vep_core::cache_manifest::{CacheManifest, HashingReader};
+use vep_core::cache_manifest::{CacheManifest, Digest};
 use vep_core::coordinate::is_cache_path_component;
 use vep_core::stderr;
 
@@ -118,9 +118,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_verify: bool,
     },
-    /// Check a binary annotation store against its table in full: the SHA256
-    /// of the whole .vpd and of the whole table, which a plugin's open checks
-    /// only by length and by their first and last MiB.
+    /// Check a binary annotation store against its table in full: the chunked
+    /// SHA256 of the whole .vpd and of the whole table (not their sha256sum),
+    /// which a plugin's open checks only by length and by their first and last
+    /// MiB.
     Verify {
         /// The binary data file (.vpd); its index (.vpdi) lies beside it.
         #[arg(long)]
@@ -695,7 +696,7 @@ fn stream_table(
     let read_failed = || format!("failed to read {}", path.display());
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let hashed = HashingReader::new(file.try_clone().with_context(read_failed)?);
+    let hashed = ChunkHashed::new(file.try_clone().with_context(read_failed)?);
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, INFLATING_THREADS);
@@ -785,7 +786,7 @@ fn stream_table(
 
     let sha256 = reader
         .finish()
-        .and_then(HashingReader::digest_to_end)
+        .and_then(ChunkHashed::digest_to_end)
         .with_context(read_failed)?;
     let length = file.stream_position().with_context(read_failed)?;
 
@@ -803,6 +804,36 @@ fn stream_table(
         ),
         rows,
     })
+}
+
+/// A reader taking the digest a store's index records of every byte read
+/// ([`vep_builtins::binary_store::chunked_sha256`]).
+struct ChunkHashed<R> {
+    inner: R,
+    hashed: vep_builtins::binary_store::ChunkedSha256<std::io::Sink>,
+}
+
+impl<R: Read> ChunkHashed<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hashed: vep_builtins::binary_store::ChunkedSha256::new(std::io::sink()),
+        }
+    }
+
+    /// Reads the rest of the stream and returns the digest of all of it.
+    fn digest_to_end(mut self) -> std::io::Result<Digest> {
+        std::io::copy(&mut self.inner, &mut self.hashed)?;
+        Ok(self.hashed.finish().1)
+    }
+}
+
+impl<R: Read> Read for ChunkHashed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hashed.write_all(&buf[..read])?;
+        Ok(read)
+    }
 }
 
 /// The most starts [`Spans`] keeps the rows of, [`SAMPLED_STARTS`] times a
@@ -933,7 +964,7 @@ fn read_tabix_records(path: &Path, cfg: &TabixConfig) -> Result<GroupedRecords> 
 
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut hashed = HashingReader::new(&file);
+    let mut hashed = ChunkHashed::new(&file);
     let reader = bgzf::io::Reader::new(&mut hashed);
     let buf_reader = BufReader::new(reader);
 
@@ -3754,9 +3785,9 @@ mod tests {
     /// seals the index again to reach the check behind the trailer.
     fn resealed(index: &[u8]) -> Vec<u8> {
         let body = &index[..index.len() - (32 + 8 + 32)];
-        let digest = HashingReader::new(body).digest_to_end().unwrap();
+        let digest = vep_builtins::binary_store::chunked_sha256(body);
         // A body under one MiB is sampled whole from each end.
-        let sampled = HashingReader::new(&[body, body].concat()[..])
+        let sampled = vep_core::cache_manifest::HashingReader::new(&[body, body].concat()[..])
             .digest_to_end()
             .unwrap();
         let length = (body.len() as u64).to_le_bytes();

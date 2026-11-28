@@ -16,8 +16,9 @@
 //!   u16, end_col: u16, ref_col: u16, zero_based: u8)` with `u16::MAX` for an
 //!   absent column, the identity `(sha256: [u8; 32], length: u64, sampled:
 //!   [u8; 32])` of the complete table the store was built from and then of the
-//!   `.vpd` file, `sampled` the SHA256 of the file's first and last MiB
-//!   ([`SAMPLE_BYTES`]), chromosome count `u32`
+//!   `.vpd` file, `sha256` the file's chunked SHA256 (`chunked_sha256`,
+//!   which is not its `sha256sum`) and `sampled` the SHA256 of its first and
+//!   last MiB ([`SAMPLE_BYTES`]), chromosome count `u32`
 //! - Chromosome table: one entry per chromosome, `(name_len: u16, name: [u8],
 //!   longest_span: u64, position_count: u64)`, each followed inline by that
 //!   chromosome's position index; `longest_span` is the largest `end - start`
@@ -25,9 +26,9 @@
 //!   by its start can lie and still reach into the query
 //! - Per-chromosome position index: sorted array of `(position: u64, data_offset: u64, record_count: u32)`,
 //!   one entry per distinct position, `data_offset` into the `.vpd` file
-//! - Trailer: the SHA256 of every byte before it, their count `u64`, and
-//!   their sampled digest, the file's last 72 bytes (a version 5 index ends
-//!   with the SHA256 alone)
+//! - Trailer: the chunked SHA256 of every byte before it, their count `u64`,
+//!   and their sampled digest, the file's last 72 bytes (a version 5 index
+//!   ends with their plain SHA256 alone, and records its files' plain SHA256)
 //!
 //! **Data file (`.vpd`)**: large, memory-mapped:
 //! - Header: magic `VPDA`, version `u32`, column count `u16`
@@ -46,7 +47,7 @@
 //! lie in the table's order, the order `tabix` prints them in.
 //!
 //! A store answers for one table's content: the index records the length, the
-//! SHA256 and the sampled digest of the complete table and of the data file,
+//! chunked SHA256 and the sampled digest of the complete table and of the data file,
 //! and [`BinaryAnnotator::open`] refuses a store whose table or data differs
 //! from the record in length or in the bytes of its first or last MiB, naming
 //! which, reading those bytes alone. A table replaced under its name, or an
@@ -60,7 +61,8 @@
 //! The index answers for its own bytes as well: every open holds the bytes
 //! before its trailer to the count and the sampled digest the trailer
 //! records before any of its counts is read, and [`BinaryAnnotator::verify`]
-//! holds them to its SHA256 too, as every open holds a version 5 index. A
+//! holds them to its chunked SHA256 too, as every open holds a version 5
+//! index to its SHA256. A
 //! change of the same length between the index's first and last MiB is seen
 //! by `verify` alone. An index naming one chromosome
 //! twice is refused naming the chromosome, and one holding a chromosome's
@@ -80,13 +82,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{self, BufWriter, Read as IoRead, Seek, Write as IoWrite};
+use std::io::{self, BufReader, BufWriter, Read as IoRead, Seek, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 use vep_core::assembly::Assembly;
 use vep_core::cache_manifest::{Digest, HashingReader, HashingWriter};
 
@@ -107,6 +110,8 @@ const INDEX_FORMAT_VERSION: u32 = 6;
 /// The earlier index version still read: it records no sampled digest, so an
 /// open holds its files to their whole SHA256.
 const UNSAMPLED_INDEX_VERSION: u32 = 5;
+/// The bytes one read of a file being hashed takes.
+const READ_BYTES: usize = 1 << 20;
 /// The bytes at each end of a file its sampled digest reads.
 pub const SAMPLE_BYTES: u64 = 1 << 20;
 /// The bytes of the SHA256 digest an index ends with.
@@ -114,6 +119,141 @@ const INDEX_DIGEST_BYTES: usize = 32;
 /// The bytes a version 6 index ends with: the SHA256 of the bytes before
 /// them, their count, and their sampled digest ([`sampled_digest`]).
 const INDEX_TRAILER_BYTES: usize = INDEX_DIGEST_BYTES + 8 + 32;
+/// The bytes of one chunk of a chunked SHA256 ([`chunked_sha256`]).
+const CHUNK_BYTES: usize = 64 << 20;
+/// What a chunked SHA256 hashes before the chunks' digests, so that it never
+/// equals the SHA256 of the same bytes.
+const CHUNKED_PREFIX: &[u8; 8] = b"VPDTREE1";
+/// The chunks a [`ChunkedSha256`] has hashing at once, beside the one it
+/// fills.
+const CHUNKS_HASHING: usize = 3;
+
+/// The digest a version 6 index records of a whole file: the SHA256 of
+/// `VPDTREE1`, the chunk size of 64 MiB as a little-endian `u64`, then the
+/// SHA256 of each 64 MiB chunk of the bytes in order, the last chunk shorter.
+/// The chunks are hashed side by side, so it is not the bytes' `sha256sum`.
+#[doc(hidden)]
+pub fn chunked_sha256(bytes: &[u8]) -> Digest {
+    chunked_sha256_in(bytes, CHUNK_BYTES)
+}
+
+/// [`chunked_sha256`] over chunks of `chunk_bytes`.
+fn chunked_sha256_in(bytes: &[u8], chunk_bytes: usize) -> Digest {
+    let chunks: Vec<Digest> = bytes.par_chunks(chunk_bytes).map(sha256).collect();
+    chunk_root(&chunks, chunk_bytes)
+}
+
+/// The SHA256 of `bytes`.
+fn sha256(bytes: &[u8]) -> Digest {
+    let mut hashed = HashingWriter::new(io::sink());
+    let _ = hashed.write_all(bytes);
+    hashed.finish().1
+}
+
+/// The chunked SHA256 whose chunks have the digests `chunks`.
+fn chunk_root(chunks: &[Digest], chunk_bytes: usize) -> Digest {
+    let mut hashed = HashingWriter::new(io::sink());
+    let _ = hashed.write_all(CHUNKED_PREFIX);
+    let _ = hashed.write_all(&(chunk_bytes as u64).to_le_bytes());
+    for chunk in chunks {
+        let _ = hashed.write_all(chunk);
+    }
+    hashed.finish().1
+}
+
+/// A writer that takes the [`chunked_sha256`] of every byte its inner writer
+/// accepts, each full chunk hashed on the rayon pool while the next fills;
+/// [`Self::finish`] hands the inner writer back with the digest.
+#[doc(hidden)]
+pub struct ChunkedSha256<W> {
+    inner: W,
+    chunk_bytes: usize,
+    chunk: Vec<u8>,
+    /// The digests of the chunks being hashed, in order.
+    hashing: std::collections::VecDeque<Receiver<Digest>>,
+    hashed: Vec<Digest>,
+}
+
+impl<W: IoWrite> ChunkedSha256<W> {
+    pub fn new(inner: W) -> Self {
+        Self::with_chunks(inner, CHUNK_BYTES)
+    }
+
+    fn with_chunks(inner: W, chunk_bytes: usize) -> Self {
+        Self {
+            inner,
+            chunk_bytes,
+            chunk: Vec::with_capacity(chunk_bytes),
+            hashing: Default::default(),
+            hashed: Vec::new(),
+        }
+    }
+
+    /// Hands the full chunk to the pool, waiting for the oldest chunk once
+    /// more than [`CHUNKS_HASHING`] are hashing.
+    fn hand_over(&mut self) {
+        let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(self.chunk_bytes));
+        let (digest, received) = mpsc::sync_channel(1);
+        rayon::spawn(move || {
+            let _ = digest.send(sha256(&chunk));
+        });
+        self.hashing.push_back(received);
+        while self.hashing.len() > CHUNKS_HASHING {
+            self.take_oldest();
+        }
+    }
+
+    fn take_oldest(&mut self) {
+        if let Some(received) = self.hashing.pop_front() {
+            // A hashing job that never answered panicked, which aborts.
+            self.hashed.push(received.recv().unwrap_or_default());
+        }
+    }
+
+    /// The inner writer and the chunked SHA256 of every byte written.
+    pub fn finish(mut self) -> (W, Digest) {
+        if !self.chunk.is_empty() {
+            self.hand_over();
+        }
+        while !self.hashing.is_empty() {
+            self.take_oldest();
+        }
+        let root = chunk_root(&self.hashed, self.chunk_bytes);
+        (self.inner, root)
+    }
+}
+
+impl<W: IoWrite> IoWrite for ChunkedSha256<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        let mut taken = &buf[..written];
+        while !taken.is_empty() {
+            let room = self.chunk_bytes - self.chunk.len();
+            let (now, rest) = taken.split_at(room.min(taken.len()));
+            self.chunk.extend_from_slice(now);
+            if self.chunk.len() == self.chunk_bytes {
+                self.hand_over();
+            }
+            taken = rest;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The digest an index of `version` records of the whole of `bytes`: their
+/// SHA256 in a version 5 index, their [`chunked_sha256`] otherwise.
+fn whole_digest(version: u32, bytes: &[u8]) -> Digest {
+    if version == UNSAMPLED_INDEX_VERSION {
+        sha256(bytes)
+    } else {
+        chunked_sha256(bytes)
+    }
+}
+
 /// The conversion that rebuilds a store, as a store's refusals name it.
 const RECONVERT: &str = "convert the table again with vep-cache-converter convert-plugin-data";
 
@@ -126,13 +266,15 @@ pub(crate) fn names_the_conversion(refusal: &PluginError) -> bool {
     refusal.detail().contains(RECONVERT)
 }
 
-/// The content of a file as a store's index records it: the SHA256 digest of
-/// all its bytes, their count, and the SHA256 of its first and last
+/// The content of a file as a store's index records it: the digest of all
+/// its bytes, their count, and the SHA256 of its first and last
 /// [`SAMPLE_BYTES`] ([`ContentIdentity::sampled_of_file`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContentIdentity {
-    /// The SHA256 digest of the whole file.
+    /// The digest of the whole file: in a version 6 index the chunked SHA256
+    /// (`chunked_sha256`), which is not the file's `sha256sum`, and in a
+    /// version 5 index its SHA256.
     pub sha256: Digest,
     /// The file's length in bytes.
     pub length: u64,
@@ -152,7 +294,8 @@ impl ContentIdentity {
         }
     }
 
-    /// The identity of the file at `path`, read once to its end.
+    /// The identity of the file at `path` as a version 6 index records it,
+    /// read once to its end.
     pub fn of_file(path: &Path) -> io::Result<Self> {
         Self::of_handle(&File::open(path)?)
     }
@@ -160,7 +303,9 @@ impl ContentIdentity {
     /// The identity of the open `file`, read once from its start to its end.
     fn of_handle(mut file: &File) -> io::Result<Self> {
         file.seek(io::SeekFrom::Start(0))?;
-        let sha256 = HashingReader::new(file).digest_to_end()?;
+        let mut hashed = ChunkedSha256::new(io::sink());
+        io::copy(&mut BufReader::with_capacity(READ_BYTES, file), &mut hashed)?;
+        let sha256 = hashed.finish().1;
         let length = file.stream_position()?;
         Ok(Self {
             sha256,
@@ -417,13 +562,25 @@ impl VpdIndex {
         self.source.same_sample(&table_sample, &source_binding)
     }
 
-    /// Refuses a data file `data`, or a table at `table`, whose SHA256 is not
-    /// the one the index records, naming which; both are read whole.
+    /// Refuses a data file `data`, or a table at `table`, whose whole digest
+    /// ([`whole_digest`]) is not the one the index records, naming which;
+    /// both are read whole, the chunks of a version 6 index hashed side by
+    /// side.
     fn check_whole(&self, vpd_path: &Path, data: &[u8], table: &Path) -> Result<(), PluginError> {
         let (data_binding, source_binding) = bindings(vpd_path, table);
-        let data_digest = HashingReader::new(data).digest_to_end().map_err(read_err)?;
-        self.data.same_digest(&data_digest, &data_binding)?;
-        let found = ContentIdentity::of_file(table).map_err(|e| unreadable_table(table, e))?;
+        self.data
+            .same_digest(&whole_digest(self.version, data), &data_binding)?;
+        let unreadable = |e| unreadable_table(table, e);
+        let found = if self.version == UNSAMPLED_INDEX_VERSION {
+            let file = File::open(table).map_err(unreadable)?;
+            let sha256 = HashingReader::new(&file)
+                .digest_to_end()
+                .map_err(unreadable)?;
+            let length = file.metadata().map_err(unreadable)?.len();
+            ContentIdentity::new(sha256, length, [0; 32])
+        } else {
+            ContentIdentity::of_file(table).map_err(unreadable)?
+        };
         self.source.same_length(found.length, &source_binding)?;
         self.source.same_digest(&found.sha256, &source_binding)
     }
@@ -1348,7 +1505,7 @@ impl BinaryStoreWriter {
             previous_index_removed: false,
             published_whole: false,
         };
-        stream.direct = Some(OffThreadWriter::new(data));
+        stream.direct = Some(Mutex::new(OffThreadWriter::new(data)));
         stream.write_header()?;
         Ok(stream)
     }
@@ -1434,11 +1591,26 @@ const ENTRIES_CHUNK: usize = HANDED_BYTES / ENTRY_BYTES;
 /// once: the one being filled and those its threads hash and write.
 const HANDED_CHUNKS: usize = 4;
 
+/// The writer a stream's mutex holds, which no thread locks.
+fn unlocked(direct: &mut Mutex<OffThreadWriter>) -> &mut OffThreadWriter {
+    direct
+        .get_mut()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`unlocked`], the mutex taken apart.
+fn into_unlocked(direct: Mutex<OffThreadWriter>) -> OffThreadWriter {
+    direct
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A file written whole, its bytes hashed by one thread and written by
 /// another, so the caller neither hashes nor waits on the file but for a
-/// full queue. [`Self::finish`] returns the file and the SHA256 of every
-/// byte taken; a failed write is returned by the next write or by
-/// [`Self::finish`].
+/// full queue; the hashing thread hands each full chunk of a
+/// [`ChunkedSha256`] to the rayon pool. [`Self::finish`] returns the file and
+/// the chunked SHA256 of every byte taken; a failed write is returned by the
+/// next write or by [`Self::finish`].
 struct OffThreadWriter {
     chunk: Vec<u8>,
     to_hash: Option<SyncSender<Vec<u8>>>,
@@ -1456,7 +1628,7 @@ impl OffThreadWriter {
             let _ = to_spare.send(Vec::with_capacity(HANDED_BYTES));
         }
         let hasher = thread::spawn(move || {
-            let mut hashed = HashingWriter::new(io::sink());
+            let mut hashed = ChunkedSha256::new(io::sink());
             for chunk in hash_rx {
                 let _ = hashed.write_all(&chunk);
                 if to_write.send(chunk).is_err() {
@@ -1595,7 +1767,9 @@ pub struct BinaryStoreStream {
     span_files: usize,
     /// The data file, hashed as it is written, while every chromosome has
     /// come in one run in start order and its rows go straight into it.
-    direct: Option<OffThreadWriter>,
+    /// The mutex is never locked: it keeps the stream `Sync` and unwind safe,
+    /// and the writer is reached through `&mut self`.
+    direct: Option<Mutex<OffThreadWriter>>,
     /// The bytes given to `direct`, the header's among them.
     direct_bytes: u64,
     /// The bytes of one row, encoded before it is written.
@@ -1660,7 +1834,7 @@ impl BinaryStoreStream {
             header.extend_from_slice(name.as_bytes());
         }
         self.direct_bytes = header.len() as u64;
-        match &mut self.direct {
+        match self.direct.as_mut().map(unlocked) {
             Some(direct) => direct.write_all(&header),
             None => (&self.scratch.data).write_all(&header),
         }
@@ -1781,7 +1955,7 @@ impl BinaryStoreStream {
             encoded.extend_from_slice(&value_len.to_le_bytes());
             encoded.extend_from_slice(cell);
         }
-        match (&mut open.rows, &mut self.direct) {
+        match (&mut open.rows, self.direct.as_mut().map(unlocked)) {
             (Some(rows), _) => rows.write_all(encoded),
             (None, Some(direct)) => direct.write_all(encoded),
             (None, None) => Err(io::Error::other("no rows file is open")),
@@ -1879,7 +2053,7 @@ impl BinaryStoreStream {
     /// the data file to its rows scratch file, the data file keeps its header
     /// alone, and from here on the stream stores as [`Self::finish`] says.
     fn leave_direct(&mut self) -> Result<(), PluginError> {
-        let Some(direct) = self.direct.take() else {
+        let Some(direct) = self.direct.take().map(into_unlocked) else {
             return Ok(());
         };
         let (data, _) = direct.finish().map_err(write_err)?;
@@ -1944,7 +2118,7 @@ impl BinaryStoreStream {
                 data_path.display()
             ))
         };
-        let (data_size, data) = if let Some(direct) = self.direct.take() {
+        let (data_size, data) = if let Some(direct) = self.direct.take().map(into_unlocked) {
             let (file, sha256) = direct.finish().map_err(write_err)?;
             let length = self.direct_bytes;
             let sampled = sampled_digest(&file, length).map_err(unread)?;
@@ -2682,7 +2856,7 @@ fn index_body<'a>(
         }
         (body, recorded)
     };
-    let found = HashingReader::new(body).digest_to_end().map_err(read_err)?;
+    let found = whole_digest(version, body);
     if found != *recorded {
         return Err(refusal(format_args!(
             "has SHA256 {} before its last {} bytes, which record {}",
@@ -2794,9 +2968,9 @@ mod tests {
     const DIGEST_BYTES: usize = INDEX_TRAILER_BYTES;
 
     /// `body` followed by the trailer the writer ends an index with: the
-    /// SHA256 of its bytes, their count and their sampled digest.
+    /// chunked SHA256 of its bytes, their count and their sampled digest.
     fn sealed(body: &[u8]) -> Vec<u8> {
-        let digest = HashingReader::new(body).digest_to_end().unwrap();
+        let digest = chunked_sha256(body);
         let length = body.len() as u64;
         let sampled = sampled_digest(io::Cursor::new(body), length).unwrap();
         [body, &digest[..], &length.to_le_bytes(), &sampled[..]].concat()
@@ -2846,6 +3020,57 @@ mod tests {
             },
             source,
         )
+    }
+
+    /// The chunked SHA256 by its definition, computed one chunk after
+    /// another: the SHA256 of the prefix, the chunk size and each chunk's
+    /// SHA256 in order.
+    fn serial_chunked(bytes: &[u8], chunk_bytes: usize) -> Digest {
+        let sha = |bytes: &[u8]| HashingReader::new(bytes).digest_to_end().unwrap();
+        let mut root = CHUNKED_PREFIX.to_vec();
+        root.extend_from_slice(&(chunk_bytes as u64).to_le_bytes());
+        for chunk in bytes.chunks(chunk_bytes) {
+            root.extend_from_slice(&sha(chunk));
+        }
+        sha(&root)
+    }
+
+    /// A chunked SHA256 equals its serial definition at every chunk
+    /// boundary: no byte, one byte, exactly one chunk, one byte over it and
+    /// several chunks, whether taken of bytes in memory or written in pieces
+    /// that straddle the chunks. It is not the bytes' SHA256, and a change in
+    /// a middle chunk changes it.
+    #[test]
+    fn a_chunked_sha256_equals_its_serial_definition_at_every_chunk_boundary() {
+        const CHUNK: usize = 64;
+        let bytes: Vec<u8> = (0..10 * CHUNK + 7).map(|i| (i * 31 % 251) as u8).collect();
+        for length in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK, 10 * CHUNK + 7] {
+            let bytes = &bytes[..length];
+            let expected = serial_chunked(bytes, CHUNK);
+            assert_eq!(chunked_sha256_in(bytes, CHUNK), expected, "{length} bytes");
+            for piece in [1, 5, CHUNK, 3 * CHUNK + 2] {
+                let mut written = ChunkedSha256::with_chunks(Vec::new(), CHUNK);
+                for part in bytes.chunks(piece) {
+                    written.write_all(part).unwrap();
+                }
+                let (inner, digest) = written.finish();
+                assert_eq!(inner, bytes, "{length} bytes in pieces of {piece}");
+                assert_eq!(digest, expected, "{length} bytes in pieces of {piece}");
+            }
+            let plain = HashingReader::new(bytes).digest_to_end().unwrap();
+            assert_ne!(expected, plain, "{length} bytes");
+        }
+        let mut changed = bytes.clone();
+        changed[5 * CHUNK + 3] ^= 1;
+        assert_ne!(
+            chunked_sha256_in(&changed, CHUNK),
+            chunked_sha256_in(&bytes, CHUNK)
+        );
+        // The store's own chunks: no byte and one byte, which lie in no chunk
+        // and in one chunk shorter than the rest.
+        for bytes in [&b""[..], &b"x"[..]] {
+            assert_eq!(chunked_sha256(bytes), serial_chunked(bytes, CHUNK_BYTES));
+        }
     }
 
     #[test]
@@ -3705,7 +3930,7 @@ mod tests {
         };
         let table_bytes = std::fs::read(&table).unwrap();
         let data_bytes = std::fs::read(&vpd_path).unwrap();
-        let digest = |bytes: &[u8]| hex(&HashingReader::new(bytes).digest_to_end().unwrap());
+        let digest = |bytes: &[u8]| hex(&chunked_sha256(bytes));
         let sample = |bytes: &[u8]| {
             hex(&sampled_digest(io::Cursor::new(bytes), bytes.len() as u64).unwrap())
         };
@@ -3834,15 +4059,17 @@ mod tests {
         assert!(BinaryAnnotator::open(&vpd_path, &config).is_err());
 
         // The same index as version 5 writes it, without the two sampled
-        // digests, is held to the whole table's SHA256 on every open.
+        // digests and with the plain SHA256 of each file, is held to the
+        // whole table's SHA256 on every open, and `verify` holds it to the
+        // plain SHA256 of both files.
         let vpdi_path = vpd_path.with_extension("vpdi");
         let index = std::fs::read(&vpdi_path).unwrap();
         let body = &index[..index.len() - DIGEST_BYTES];
         let mut v5 = body[..IDENTITY_AT].to_vec();
         v5[4..8].copy_from_slice(&5u32.to_le_bytes());
-        for identity in 0..2 {
-            let at = IDENTITY_AT + identity * IDENTITY_BYTES;
-            v5.extend_from_slice(&body[at..at + 32 + 8]);
+        for file in [&bytes, &std::fs::read(&vpd_path).unwrap()] {
+            v5.extend_from_slice(&HashingReader::new(&file[..]).digest_to_end().unwrap());
+            v5.extend_from_slice(&(file.len() as u64).to_le_bytes());
         }
         v5.extend_from_slice(&body[IDENTITY_AT + 2 * IDENTITY_BYTES..]);
         let v5_digest = HashingReader::new(&v5[..]).digest_to_end().unwrap();
@@ -3850,6 +4077,7 @@ mod tests {
         std::fs::write(&table, &bytes).unwrap();
         let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
         assert_eq!(store.query("21", 200, 200).unwrap().len(), 1);
+        BinaryAnnotator::verify(&vpd_path, &table).unwrap();
         std::fs::write(&table, &middle).unwrap();
         let refused = BinaryAnnotator::open(&vpd_path, &config)
             .err()

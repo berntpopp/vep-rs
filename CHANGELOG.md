@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `vep-cache-converter verify` holds a `.vpd` store to the whole SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep that check at open. (#142)
+- `vep-cache-converter verify` holds a `.vpd` store to the chunked SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep plain SHA256 at open. (#142)
 
 ### Changed
 
