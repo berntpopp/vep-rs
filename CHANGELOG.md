@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Caches, reference FASTA and the cache tools
-  - `vep-cache-converter verify` holds a `.vpd` store to the whole SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep that check at open. (#142)
+  - `vep-cache-converter verify` holds a `.vpd` store to the chunked SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep plain SHA256 at open. (#142)
+  - `vep-cache-converter convert-plugin-data` writes a sorted table's rows straight into the store and reads and hashes on worker threads: whole-genome CADD in 27 minutes against 127, Broadwell.
 - Library crates
   - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once. (#162)
 
@@ -30,10 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0. (#162)
   - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads. (#141)
   - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads. (#154)
+  - `gnomADc` writes a batch's coverage means for its variants side by side on the run's threads: 15 percent less wall time on whole-genome ClinVar, 16 threads.
   - Tabix tables indexed on their start column alone (`gnomADc`, `CADD`, `SpliceAI` and others) read only each batch's own windows, side by side: 56 percent less wall time for `gnomADc` on ClinVar chr21, 16 threads. (#140)
+  - Short spans of start-column tabix tables are read side by side without Linux readahead: 77 percent less wall time on a whole exome with five plugins, cold cache, 16 threads.
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file. (#156)
   - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store. (#142)
 - Caches, reference FASTA and the cache tools
+  - A `.json.gz` cache shard inflates in one libdeflate call: a 46,757-variant exome on gzip shards takes 18 percent less wall time from a warm page cache, 16 threads.
+  - Two prewarm loads run at once, one merging while the next parses: 31 percent less wall time on a 46,757-variant exome (7 percent from a cold page cache), 16 threads.
   - Each batch loads only the transcript shards its sequence records reach, and chromosomes the input left are released: 24 SNVs on 24 chromosomes peak at 0.80 GB, not 8.27 GB. (#187)
   - A run without `--sift` or `--polyphen` skips the transcript shards' SIFT and PolyPhen matrices: peak memory 43 percent lower on 24 SNVs across 24 chromosomes, 16 threads. (#139)
   - `vep-cache-builder` releases the transcript inputs and core dumps before writing variation files, which lowers that phase's resident memory 15% (2.08 to 1.77 GB, GRCh38 chr21 build); peak memory is unchanged. (#184)

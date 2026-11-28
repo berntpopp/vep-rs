@@ -16,8 +16,9 @@
 //!   u16, end_col: u16, ref_col: u16, zero_based: u8)` with `u16::MAX` for an
 //!   absent column, the identity `(sha256: [u8; 32], length: u64, sampled:
 //!   [u8; 32])` of the complete table the store was built from and then of the
-//!   `.vpd` file, `sampled` the SHA256 of the file's first and last MiB
-//!   ([`SAMPLE_BYTES`]), chromosome count `u32`
+//!   `.vpd` file, `sha256` the file's chunked SHA256 (`chunked_sha256`,
+//!   which is not its `sha256sum`) and `sampled` the SHA256 of its first and
+//!   last MiB ([`SAMPLE_BYTES`]), chromosome count `u32`
 //! - Chromosome table: one entry per chromosome, `(name_len: u16, name: [u8],
 //!   longest_span: u64, position_count: u64)`, each followed inline by that
 //!   chromosome's position index; `longest_span` is the largest `end - start`
@@ -25,14 +26,15 @@
 //!   by its start can lie and still reach into the query
 //! - Per-chromosome position index: sorted array of `(position: u64, data_offset: u64, record_count: u32)`,
 //!   one entry per distinct position, `data_offset` into the `.vpd` file
-//! - Trailer: the SHA256 of every byte before it, their count `u64`, and
-//!   their sampled digest, the file's last 72 bytes (a version 5 index ends
-//!   with the SHA256 alone)
+//! - Trailer: the chunked SHA256 of every byte before it, their count `u64`,
+//!   and their sampled digest, the file's last 72 bytes (a version 5 index
+//!   ends with their plain SHA256 alone, and records its files' plain SHA256)
 //!
 //! **Data file (`.vpd`)**: large, memory-mapped:
 //! - Header: magic `VPDA`, version `u32`, column count `u16`
 //! - Column name table: the header row, stored once
-//! - Records: contiguous, sorted by (chr, position), each record is:
+//! - Records: a chromosome's contiguous and sorted by position, the
+//!   chromosomes in the order the index gives them, each record is:
 //!   - `position: u64`, `end_position: u64`, `field_count: u16`
 //!   - For each field: `value_len: u16` + `value: [u8; value_len]`
 //!
@@ -45,7 +47,7 @@
 //! lie in the table's order, the order `tabix` prints them in.
 //!
 //! A store answers for one table's content: the index records the length, the
-//! SHA256 and the sampled digest of the complete table and of the data file,
+//! chunked SHA256 and the sampled digest of the complete table and of the data file,
 //! and [`BinaryAnnotator::open`] refuses a store whose table or data differs
 //! from the record in length or in the bytes of its first or last MiB, naming
 //! which, reading those bytes alone. A table replaced under its name, or an
@@ -59,7 +61,8 @@
 //! The index answers for its own bytes as well: every open holds the bytes
 //! before its trailer to the count and the sampled digest the trailer
 //! records before any of its counts is read, and [`BinaryAnnotator::verify`]
-//! holds them to its SHA256 too, as every open holds a version 5 index. A
+//! holds them to its chunked SHA256 too, as every open holds a version 5
+//! index to its SHA256. A
 //! change of the same length between the index's first and last MiB is seen
 //! by `verify` alone. An index naming one chromosome
 //! twice is refused naming the chromosome, and one holding a chromosome's
@@ -81,9 +84,12 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read as IoRead, Seek, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 use vep_core::assembly::Assembly;
 use vep_core::cache_manifest::{Digest, HashingReader, HashingWriter};
 
@@ -104,6 +110,8 @@ const INDEX_FORMAT_VERSION: u32 = 6;
 /// The earlier index version still read: it records no sampled digest, so an
 /// open holds its files to their whole SHA256.
 const UNSAMPLED_INDEX_VERSION: u32 = 5;
+/// The bytes one read of a file being hashed takes.
+const READ_BYTES: usize = 1 << 20;
 /// The bytes at each end of a file its sampled digest reads.
 pub const SAMPLE_BYTES: u64 = 1 << 20;
 /// The bytes of the SHA256 digest an index ends with.
@@ -111,6 +119,157 @@ const INDEX_DIGEST_BYTES: usize = 32;
 /// The bytes a version 6 index ends with: the SHA256 of the bytes before
 /// them, their count, and their sampled digest ([`sampled_digest`]).
 const INDEX_TRAILER_BYTES: usize = INDEX_DIGEST_BYTES + 8 + 32;
+/// The bytes of one chunk of a chunked SHA256 ([`chunked_sha256`]).
+const CHUNK_BYTES: usize = 64 << 20;
+/// What a chunked SHA256 hashes before the chunks' digests, so that it never
+/// equals the SHA256 of the same bytes.
+const CHUNKED_PREFIX: &[u8; 8] = b"VPDTREE1";
+/// The chunks a [`ChunkedSha256`] has hashing at once, beside the one it
+/// fills.
+const CHUNKS_HASHING: usize = 3;
+
+/// The digest a version 6 index records of a whole file: the SHA256 of
+/// `VPDTREE1`, the chunk size of 64 MiB as a little-endian `u64`, then the
+/// SHA256 of each 64 MiB chunk of the bytes in order, the last chunk shorter.
+/// The chunks are hashed side by side, so it is not the bytes' `sha256sum`.
+#[doc(hidden)]
+pub fn chunked_sha256(bytes: &[u8]) -> Digest {
+    chunked_sha256_in(bytes, CHUNK_BYTES)
+}
+
+/// [`chunked_sha256`] over chunks of `chunk_bytes`.
+fn chunked_sha256_in(bytes: &[u8], chunk_bytes: usize) -> Digest {
+    let chunks: Vec<Digest> = bytes.par_chunks(chunk_bytes).map(sha256).collect();
+    chunk_root(&chunks, chunk_bytes)
+}
+
+/// The SHA256 of `bytes`.
+fn sha256(bytes: &[u8]) -> Digest {
+    let mut hashed = HashingWriter::new(io::sink());
+    let _ = hashed.write_all(bytes);
+    hashed.finish().1
+}
+
+/// The chunked SHA256 whose chunks have the digests `chunks`.
+fn chunk_root(chunks: &[Digest], chunk_bytes: usize) -> Digest {
+    let mut hashed = HashingWriter::new(io::sink());
+    let _ = hashed.write_all(CHUNKED_PREFIX);
+    let _ = hashed.write_all(&(chunk_bytes as u64).to_le_bytes());
+    for chunk in chunks {
+        let _ = hashed.write_all(chunk);
+    }
+    hashed.finish().1
+}
+
+/// A writer that takes the [`chunked_sha256`] of every byte its inner writer
+/// accepts, each full chunk hashed on the rayon pool while the next fills;
+/// [`Self::finish`] hands the inner writer back with the digest.
+#[doc(hidden)]
+pub struct ChunkedSha256<W> {
+    inner: W,
+    chunk_bytes: usize,
+    chunk: Vec<u8>,
+    /// The chunks being hashed, in order, each handed back with its digest.
+    hashing: std::collections::VecDeque<Receiver<(Digest, Vec<u8>)>>,
+    hashed: Vec<Digest>,
+    /// A chunk hashed and emptied, for the next to fill.
+    spare: Option<Vec<u8>>,
+}
+
+impl<W: IoWrite> ChunkedSha256<W> {
+    pub fn new(inner: W) -> Self {
+        Self::with_chunks(inner, CHUNK_BYTES)
+    }
+
+    fn with_chunks(inner: W, chunk_bytes: usize) -> Self {
+        Self {
+            inner,
+            chunk_bytes,
+            chunk: Vec::with_capacity(chunk_bytes),
+            hashing: Default::default(),
+            hashed: Vec::new(),
+            spare: None,
+        }
+    }
+
+    /// Hands the full chunk to the pool, waiting for the oldest chunk once
+    /// more than [`CHUNKS_HASHING`] are hashing.
+    fn hand_over(&mut self) {
+        let next = self
+            .spare
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(self.chunk_bytes));
+        let chunk = std::mem::replace(&mut self.chunk, next);
+        let (digest, received) = mpsc::sync_channel(1);
+        let hash = move || {
+            let _ = digest.send((sha256(&chunk), chunk));
+        };
+        // A writer on a pool thread hashes in place: waiting there for a job
+        // of the same pool could wait for itself.
+        match rayon::current_thread_index() {
+            Some(_) => hash(),
+            None => rayon::spawn(hash),
+        }
+        self.hashing.push_back(received);
+        while self.hashing.len() > CHUNKS_HASHING {
+            self.take_oldest();
+        }
+    }
+
+    fn take_oldest(&mut self) {
+        if let Some(received) = self.hashing.pop_front() {
+            // A hashing job that never answered panicked, which aborts.
+            let (digest, mut chunk) = received.recv().unwrap_or_default();
+            self.hashed.push(digest);
+            chunk.clear();
+            self.spare = Some(chunk);
+        }
+    }
+
+    /// The inner writer and the chunked SHA256 of every byte written.
+    pub fn finish(mut self) -> (W, Digest) {
+        if !self.chunk.is_empty() {
+            self.hand_over();
+        }
+        while !self.hashing.is_empty() {
+            self.take_oldest();
+        }
+        let root = chunk_root(&self.hashed, self.chunk_bytes);
+        (self.inner, root)
+    }
+}
+
+impl<W: IoWrite> IoWrite for ChunkedSha256<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        let mut taken = &buf[..written];
+        while !taken.is_empty() {
+            let room = self.chunk_bytes - self.chunk.len();
+            let (now, rest) = taken.split_at(room.min(taken.len()));
+            self.chunk.extend_from_slice(now);
+            if self.chunk.len() == self.chunk_bytes {
+                self.hand_over();
+            }
+            taken = rest;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The digest an index of `version` records of the whole of `bytes`: their
+/// SHA256 in a version 5 index, their [`chunked_sha256`] otherwise.
+fn whole_digest(version: u32, bytes: &[u8]) -> Digest {
+    if version == UNSAMPLED_INDEX_VERSION {
+        sha256(bytes)
+    } else {
+        chunked_sha256(bytes)
+    }
+}
+
 /// The conversion that rebuilds a store, as a store's refusals name it.
 const RECONVERT: &str = "convert the table again with vep-cache-converter convert-plugin-data";
 
@@ -123,13 +282,15 @@ pub(crate) fn names_the_conversion(refusal: &PluginError) -> bool {
     refusal.detail().contains(RECONVERT)
 }
 
-/// The content of a file as a store's index records it: the SHA256 digest of
-/// all its bytes, their count, and the SHA256 of its first and last
+/// The content of a file as a store's index records it: the digest of all
+/// its bytes, their count, and the SHA256 of its first and last
 /// [`SAMPLE_BYTES`] ([`ContentIdentity::sampled_of_file`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContentIdentity {
-    /// The SHA256 digest of the whole file.
+    /// The digest of the whole file: in a version 6 index the chunked SHA256
+    /// (`chunked_sha256`), which is not the file's `sha256sum`, and in a
+    /// version 5 index its SHA256.
     pub sha256: Digest,
     /// The file's length in bytes.
     pub length: u64,
@@ -149,7 +310,8 @@ impl ContentIdentity {
         }
     }
 
-    /// The identity of the file at `path`, read once to its end.
+    /// The identity of the file at `path` as a version 6 index records it,
+    /// read once to its end.
     pub fn of_file(path: &Path) -> io::Result<Self> {
         Self::of_handle(&File::open(path)?)
     }
@@ -157,7 +319,9 @@ impl ContentIdentity {
     /// The identity of the open `file`, read once from its start to its end.
     fn of_handle(mut file: &File) -> io::Result<Self> {
         file.seek(io::SeekFrom::Start(0))?;
-        let sha256 = HashingReader::new(file).digest_to_end()?;
+        let mut hashed = ChunkedSha256::new(io::sink());
+        io::copy(&mut BufReader::with_capacity(READ_BYTES, file), &mut hashed)?;
+        let sha256 = hashed.finish().1;
         let length = file.stream_position()?;
         Ok(Self {
             sha256,
@@ -414,13 +578,33 @@ impl VpdIndex {
         self.source.same_sample(&table_sample, &source_binding)
     }
 
-    /// Refuses a data file `data`, or a table at `table`, whose SHA256 is not
-    /// the one the index records, naming which; both are read whole.
-    fn check_whole(&self, vpd_path: &Path, data: &[u8], table: &Path) -> Result<(), PluginError> {
+    /// Refuses a data file `data`, or a table at `table`, whose whole digest
+    /// ([`whole_digest`]) is not the one the index records, naming which;
+    /// both are read whole, the chunks of a version 6 index hashed side by
+    /// side. The data file is read through `data`, the handle its mapping
+    /// was made from, so its pages stay out of the process's mapping.
+    fn check_whole(&self, vpd_path: &Path, data: &File, table: &Path) -> Result<(), PluginError> {
         let (data_binding, source_binding) = bindings(vpd_path, table);
-        let data_digest = HashingReader::new(data).digest_to_end().map_err(read_err)?;
+        let data_digest = if self.version == UNSAMPLED_INDEX_VERSION {
+            (&*data)
+                .seek(io::SeekFrom::Start(0))
+                .and_then(|_| HashingReader::new(data).digest_to_end())
+        } else {
+            ContentIdentity::of_handle(data).map(|identity| identity.sha256)
+        }
+        .map_err(read_err)?;
         self.data.same_digest(&data_digest, &data_binding)?;
-        let found = ContentIdentity::of_file(table).map_err(|e| unreadable_table(table, e))?;
+        let unreadable = |e| unreadable_table(table, e);
+        let found = if self.version == UNSAMPLED_INDEX_VERSION {
+            let file = File::open(table).map_err(unreadable)?;
+            let sha256 = HashingReader::new(&file)
+                .digest_to_end()
+                .map_err(unreadable)?;
+            let length = file.metadata().map_err(unreadable)?.len();
+            ContentIdentity::new(sha256, length, [0; 32])
+        } else {
+            ContentIdentity::of_file(table).map_err(unreadable)?
+        };
         self.source.same_length(found.length, &source_binding)?;
         self.source.same_digest(&found.sha256, &source_binding)
     }
@@ -466,6 +650,10 @@ fn unreadable_table(table: &Path, e: io::Error) -> PluginError {
 struct StoreFiles {
     index: Mmap,
     data: Mmap,
+    /// The handle `data` was mapped from.
+    data_file: File,
+    /// The handle `index` was mapped from.
+    index_file: File,
 }
 
 impl StoreFiles {
@@ -497,8 +685,9 @@ impl StoreFiles {
                 vpdi_path.display()
             ))
         })?;
+        let index_file = index;
         // SAFETY: file is not modified while mapped.
-        let index = unsafe { Mmap::map(&index) }.map_err(|e| {
+        let index = unsafe { Mmap::map(&index_file) }.map_err(|e| {
             PluginError::Init(format!(
                 "failed to read index file {}: {e}",
                 vpdi_path.display()
@@ -517,7 +706,12 @@ impl StoreFiles {
                 vpd_path.display()
             ))
         })?;
-        Ok(Self { index, data })
+        Ok(Self {
+            index,
+            data,
+            data_file: file,
+            index_file,
+        })
     }
 }
 
@@ -576,9 +770,29 @@ impl BinaryAnnotator {
     /// [`Self::open`]'s refusals.
     pub fn verify(vpd_path: &Path, table: &Path) -> Result<(), PluginError> {
         let files = StoreFiles::read(vpd_path)?;
-        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"), true)?;
+        let index_path = vpd_path.with_extension("vpdi");
+        let opening = files
+            .index
+            .first_chunk::<8>()
+            .ok_or_else(|| read_err(io::ErrorKind::UnexpectedEof.into()))?;
+        index_magic(&opening[..4])?;
+        let version = u32::from_le_bytes(opening[4..].try_into().unwrap_or_default());
+        index_version(version)?;
+        let v5 = version == UNSAMPLED_INDEX_VERSION;
+        // A version 6 index is held to its trailer by `load_index`, then
+        // read whole for its digest and its order.
+        let unordered = if v5 {
+            None
+        } else {
+            index_body(&files.index, &index_path, INDEX_FORMAT_VERSION, false)?;
+            check_index_whole(&files.index, &files.index_file, &index_path)?
+        };
+        let index = Self::load_index(&files.index, &index_path, v5)?;
+        if let Some(unordered) = unordered {
+            return Err(unordered);
+        }
         index.check_sampled(vpd_path, &files.data, table)?;
-        index.check_whole(vpd_path, &files.data, table)
+        index.check_whole(vpd_path, &files.data_file, table)
     }
 
     /// Whether the store at `vpd_path` has both its files and an index of
@@ -699,7 +913,7 @@ impl BinaryAnnotator {
         let table = &config.file_path;
         index.check_sampled(vpd_path, &files.data, table)?;
         if index.version == UNSAMPLED_INDEX_VERSION {
-            index.check_whole(vpd_path, &files.data, table)?;
+            index.check_whole(vpd_path, &files.data_file, table)?;
         }
 
         let (column_names, _header_end) = Self::parse_data_header(&files.data)?;
@@ -810,10 +1024,7 @@ impl BinaryAnnotator {
                 cursor.set_position(cursor.position() + (POSITION_ENTRY_BYTES - 8) as u64);
                 // A query finds a chromosome's entries by binary search.
                 if let Some(previous) = previous.filter(|&previous| position <= previous) {
-                    return Err(PluginError::Init(format!(
-                        "index positions of chromosome {name:.32} do not ascend: {position} \
-                         follows {previous}; {RECONVERT}"
-                    )));
+                    return Err(unordered(&name, position, previous));
                 }
                 previous = Some(position);
             }
@@ -1279,7 +1490,6 @@ impl BinaryStoreWriter {
         source: &ContentIdentity,
     ) -> Result<(u64, u64, u64), PluginError> {
         let mut stream = self.stream(column_names, config)?;
-        stream.chromosomes_as_given = true;
         let mut given: HashSet<&str> = HashSet::with_capacity(records.len());
         for (chr_name, chr_records) in records {
             if !given.insert(chr_name.as_str()) {
@@ -1328,7 +1538,8 @@ impl BinaryStoreWriter {
         let layout = Layout::of(config)?;
         let published = self.published_paths()?;
         let scratch = Scratch::create(&published)?;
-        let stream = BinaryStoreStream {
+        let data = scratch.data.try_clone().map_err(write_err)?;
+        let mut stream = BinaryStoreStream {
             published,
             scratch,
             layout,
@@ -1338,11 +1549,14 @@ impl BinaryStoreWriter {
             open: None,
             rows: 0,
             span_files: 0,
-            chromosomes_as_given: false,
+            direct: None,
+            direct_bytes: 0,
+            row: Vec::new(),
             failed: false,
             previous_index_removed: false,
             published_whole: false,
         };
+        stream.direct = Some(Mutex::new(OffThreadWriter::new(data)));
         stream.write_header()?;
         Ok(stream)
     }
@@ -1417,26 +1631,164 @@ const ENTRY_BYTES: usize = 8 + 8 + 4;
 /// its cells.
 const ROW_HEAD_BYTES: usize = 8 + 8 + 2;
 
+/// The bytes [`OffThreadWriter`] hands its threads at a time.
+const HANDED_BYTES: usize = 1 << 20;
+
+/// The position entries one read of an entries scratch file takes, a chunk
+/// of [`OffThreadWriter`]'s.
+const ENTRIES_CHUNK: usize = HANDED_BYTES / ENTRY_BYTES;
+
+/// The chunks of `HANDED_BYTES` an [`OffThreadWriter`] holds, allocated
+/// once: the one being filled and those its threads hash and write.
+const HANDED_CHUNKS: usize = 4;
+
+/// The writer a stream's mutex holds, which no thread locks.
+fn unlocked(direct: &mut Mutex<OffThreadWriter>) -> &mut OffThreadWriter {
+    direct
+        .get_mut()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`unlocked`], the mutex taken apart.
+fn into_unlocked(direct: Mutex<OffThreadWriter>) -> OffThreadWriter {
+    direct
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A file written whole, its bytes hashed by one thread and written by
+/// another, so the caller neither hashes nor waits on the file but for a
+/// full queue; the hashing thread hands each full chunk of a
+/// [`ChunkedSha256`] to the rayon pool. [`Self::finish`] returns the file and
+/// the chunked SHA256 of every byte taken; a failed write is returned by the
+/// next write or by [`Self::finish`].
+struct OffThreadWriter {
+    chunk: Vec<u8>,
+    to_hash: Option<SyncSender<Vec<u8>>>,
+    spare: Receiver<Vec<u8>>,
+    hasher: Option<JoinHandle<Digest>>,
+    writer: Option<JoinHandle<io::Result<File>>>,
+}
+
+impl OffThreadWriter {
+    fn new(mut file: File) -> Self {
+        let (to_hash, hash_rx) = mpsc::sync_channel::<Vec<u8>>(HANDED_CHUNKS);
+        let (to_write, write_rx) = mpsc::sync_channel::<Vec<u8>>(HANDED_CHUNKS);
+        let (to_spare, spare) = mpsc::sync_channel(HANDED_CHUNKS);
+        for _ in 1..HANDED_CHUNKS {
+            let _ = to_spare.send(Vec::with_capacity(HANDED_BYTES));
+        }
+        let hasher = thread::spawn(move || {
+            let mut hashed = ChunkedSha256::new(io::sink());
+            for chunk in hash_rx {
+                let _ = hashed.write_all(&chunk);
+                if to_write.send(chunk).is_err() {
+                    break;
+                }
+            }
+            hashed.finish().1
+        });
+        let writer = thread::spawn(move || {
+            for chunk in write_rx {
+                file.write_all(&chunk)?;
+                let _ = to_spare.send(chunk);
+            }
+            Ok(file)
+        });
+        Self {
+            chunk: Vec::with_capacity(HANDED_BYTES),
+            to_hash: Some(to_hash),
+            spare,
+            hasher: Some(hasher),
+            writer: Some(writer),
+        }
+    }
+
+    /// Hands the bytes taken to the threads; a closed queue means the
+    /// writer failed, and its error is returned.
+    fn hand_over(&mut self) -> io::Result<()> {
+        if let Ok(next) = self.spare.recv() {
+            let chunk = std::mem::replace(&mut self.chunk, next);
+            let sent = self.to_hash.as_ref().map(|to_hash| to_hash.send(chunk));
+            if matches!(sent, Some(Ok(()))) {
+                self.chunk.clear();
+                return Ok(());
+            }
+        }
+        self.join().map(|_| ())?;
+        Err(io::Error::other("the data file's writer stopped"))
+    }
+
+    /// Waits for both threads: the digest and the file, or the write's error.
+    fn join(&mut self) -> io::Result<(File, Digest)> {
+        self.to_hash = None;
+        let stopped = || io::Error::other("the data file's writer stopped");
+        let digest = self.hasher.take().ok_or_else(stopped)?.join();
+        let file = self.writer.take().ok_or_else(stopped)?.join();
+        match (file, digest) {
+            (Ok(file), Ok(digest)) => Ok((file?, digest)),
+            _ => Err(stopped()),
+        }
+    }
+
+    /// The file, every byte taken written to it, and their SHA256.
+    fn finish(mut self) -> io::Result<(File, Digest)> {
+        if !self.chunk.is_empty() {
+            self.hand_over()?;
+        }
+        self.join()
+    }
+}
+
+impl IoWrite for OffThreadWriter {
+    /// A chunk is handed over before it outgrows its allocation.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.chunk.len() + bytes.len() > HANDED_BYTES && !self.chunk.is_empty() {
+            self.hand_over()?;
+        }
+        self.chunk.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// The bytes reach the file by [`Self::finish`].
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for OffThreadWriter {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
 /// A store being written one row at a time ([`BinaryStoreWriter::stream`]).
 ///
-/// The rows may come in any order. Each is encoded as the store's record and
-/// appended to a scratch file of its chromosome as it is given, and
-/// [`Self::finish`] writes the data file as its header followed by the
-/// chromosomes' rows in the byte order of the chromosomes' names, a
-/// chromosome's rows sorted by start and the rows of one start in the order
-/// they were given, then the index, and renames both into place. A chromosome
+/// The rows may come in any order. While each chromosome comes in one run of
+/// rows in start order, as every table `tabix` indexes has them, a row is
+/// encoded as the store's record and appended to the data file as it is
+/// given, hashed and written off the caller's thread, and the chromosomes are
+/// stored in the order given, as [`BinaryStoreWriter::write`] stores them. A
+/// chromosome given again after another, or a row below the start before it,
+/// moves every chromosome's rows to a scratch file of its own, and from then
+/// on rows are appended there: [`Self::finish`] writes the data file as its
+/// header followed by the chromosomes' rows in the byte order of the
+/// chromosomes' names, a chromosome's rows sorted by start and the rows of
+/// one start in the order they were given, and hashes it whole. A chromosome
 /// given in two separate runs of rows is one chromosome of the store.
+/// [`Self::finish`] then writes the index and renames both into place.
 ///
 /// What the stream holds in memory does not grow with the rows of a table
-/// whose chromosomes each come sorted by start, as every table `tabix` indexes
-/// has them. Of a row nothing is kept once its call returns. Of a chromosome
-/// the stream keeps its name and a fixed record of counts. The chromosome
-/// being given has one buffer of `ROWS_BUFFER` bytes. A chromosome's
-/// position entries, 20 bytes a distinct start, lie in a scratch file of their
-/// own until the index is written. A chromosome whose rows came out of start
-/// order is put in order at [`Self::finish`] by a stable sort of its rows'
-/// starts and offsets alone, 16 bytes a row of that chromosome, held while
-/// that chromosome is written.
+/// whose chromosomes each come sorted by start. Of a row nothing is kept once
+/// its call returns. Of a chromosome the stream keeps its name and a fixed
+/// record of counts. The data file's bytes pass through a few chunks of
+/// `HANDED_BYTES`, and a chromosome being given to its scratch file has one
+/// buffer of `ROWS_BUFFER` bytes. A chromosome's position entries, 20 bytes a
+/// distinct start, lie in a scratch file of their own until the index is
+/// written. A chromosome whose rows came out of start order is put in order
+/// at [`Self::finish`] by a stable sort of its rows' starts and offsets
+/// alone, 16 bytes a row of that chromosome, held while that chromosome is
+/// written.
 ///
 /// The scratch files lie beside the data file under the names `numbered_path`
 /// gives them, one of rows and one of position entries a chromosome, and only
@@ -1464,9 +1816,15 @@ pub struct BinaryStoreStream {
     rows: u64,
     /// The span scratch paths handed out ([`Self::span_scratch_path`]).
     span_files: usize,
-    /// Whether the chromosomes are stored in the order they were given, as
-    /// [`BinaryStoreWriter::write`] stores them, and not by name.
-    chromosomes_as_given: bool,
+    /// The data file, hashed as it is written, while every chromosome has
+    /// come in one run in start order and its rows go straight into it.
+    /// The mutex is never locked: it keeps the stream `Sync` and unwind safe,
+    /// and the writer is reached through `&mut self`.
+    direct: Option<Mutex<OffThreadWriter>>,
+    /// The bytes given to `direct`, the header's among them.
+    direct_bytes: u64,
+    /// The bytes of one row, encoded before it is written.
+    row: Vec<u8>,
     /// Whether a call failed, after which no row is taken and nothing is
     /// published.
     failed: bool,
@@ -1504,7 +1862,8 @@ struct StreamedChromosome {
 struct OpenChromosome {
     /// The chromosome's place in the stream's list.
     number: usize,
-    rows: BufWriter<File>,
+    /// Its rows scratch file; none while its rows go into the data file.
+    rows: Option<BufWriter<File>>,
     /// The position entries, while the chromosome's rows come in order.
     starts: Option<BufWriter<File>>,
 }
@@ -1512,7 +1871,7 @@ struct OpenChromosome {
 impl BinaryStoreStream {
     /// Writes the data file's header: the magic, the version and the column
     /// names.
-    fn write_header(&self) -> Result<(), PluginError> {
+    fn write_header(&mut self) -> Result<(), PluginError> {
         let mut header = Vec::new();
         header.extend_from_slice(VPD_MAGIC);
         header.extend_from_slice(&DATA_FORMAT_VERSION.to_le_bytes());
@@ -1525,7 +1884,12 @@ impl BinaryStoreStream {
             header.extend_from_slice(&name_len.to_le_bytes());
             header.extend_from_slice(name.as_bytes());
         }
-        (&self.scratch.data).write_all(&header).map_err(write_err)
+        self.direct_bytes = header.len() as u64;
+        match self.direct.as_mut().map(unlocked) {
+            Some(direct) => direct.write_all(&header),
+            None => (&self.scratch.data).write_all(&header),
+        }
+        .map_err(write_err)
     }
 
     /// The chromosomes given so far.
@@ -1582,12 +1946,19 @@ impl BinaryStoreStream {
         cells: &[S],
     ) -> Result<(), PluginError> {
         self.chromosome(chr)?;
+        let leaves_order = self.open.as_ref().is_some_and(|open| {
+            let chromosome = &self.chromosomes[open.number];
+            chromosome.in_order && chromosome.rows > 0 && start < chromosome.last_start
+        });
+        if leaves_order && self.direct.is_some() {
+            self.leave_direct()?;
+        }
         let Some(open) = self.open.as_mut() else {
             return Err(write_err(io::Error::other("no chromosome is open")));
         };
         let chromosome = &mut self.chromosomes[open.number];
 
-        if chromosome.in_order && chromosome.rows > 0 && start < chromosome.last_start {
+        if leaves_order {
             // The entries written so far follow the order the rows came in,
             // which is not the store's from this row on.
             chromosome.in_order = false;
@@ -1618,12 +1989,11 @@ impl BinaryStoreStream {
 
         let row = || format!("row {chr:.32}:{start}");
         let field_count = recorded(cells.len(), "cells", row)?;
-        let rows = &mut open.rows;
-        rows.write_all(&start.to_le_bytes()).map_err(write_err)?;
-        rows.write_all(&end.to_le_bytes()).map_err(write_err)?;
-        rows.write_all(&field_count.to_le_bytes())
-            .map_err(write_err)?;
-        let mut row_bytes = ROW_HEAD_BYTES as u64;
+        let encoded = &mut self.row;
+        encoded.clear();
+        encoded.extend_from_slice(&start.to_le_bytes());
+        encoded.extend_from_slice(&end.to_le_bytes());
+        encoded.extend_from_slice(&field_count.to_le_bytes());
         for (col_index, cell) in cells.iter().enumerate() {
             let cell = cell.as_ref().as_bytes();
             let value_len = recorded(cell.len(), "bytes", || {
@@ -1633,10 +2003,18 @@ impl BinaryStoreStream {
                     .map_or(String::new(), |name| format!(" ({name})"));
                 format!("{} cell {col_index}{name}", row())
             })?;
-            rows.write_all(&value_len.to_le_bytes())
-                .map_err(write_err)?;
-            rows.write_all(cell).map_err(write_err)?;
-            row_bytes += 2 + cell.len() as u64;
+            encoded.extend_from_slice(&value_len.to_le_bytes());
+            encoded.extend_from_slice(cell);
+        }
+        match (&mut open.rows, self.direct.as_mut().map(unlocked)) {
+            (Some(rows), _) => rows.write_all(encoded),
+            (None, Some(direct)) => direct.write_all(encoded),
+            (None, None) => Err(io::Error::other("no rows file is open")),
+        }
+        .map_err(write_err)?;
+        let row_bytes = encoded.len() as u64;
+        if self.direct.is_some() {
+            self.direct_bytes += row_bytes;
         }
 
         chromosome.rows += 1;
@@ -1658,6 +2036,9 @@ impl BinaryStoreStream {
         }
         self.close_open()?;
         let known = self.numbers.get(name).copied();
+        if known.is_some() && self.direct.is_some() {
+            self.leave_direct()?;
+        }
         let number = known.unwrap_or(self.chromosomes.len());
         let fresh = known.is_none();
         if fresh {
@@ -1671,21 +2052,24 @@ impl BinaryStoreStream {
                 entries: 0,
                 group_offset: 0,
                 group_rows: 0,
-                data_offset: 0,
+                data_offset: self.direct_bytes,
             });
             self.numbers.insert(name.to_string(), number);
         }
         let data = &self.published.data;
-        let rows = open_numbered(&numbered_path(data, ROWS_ROLE, number), fresh)?;
+        let rows = match self.direct {
+            Some(_) => None,
+            None => Some(self.rows_file(number, fresh)?),
+        };
         let starts = if self.chromosomes[number].in_order {
             let starts = open_numbered(&numbered_path(data, STARTS_ROLE, number), fresh)?;
-            Some(BufWriter::new(starts))
+            Some(BufWriter::with_capacity(ROWS_BUFFER, starts))
         } else {
             None
         };
         self.open = Some(OpenChromosome {
             number,
-            rows: BufWriter::with_capacity(ROWS_BUFFER, rows),
+            rows,
             starts,
         });
         Ok(())
@@ -1696,9 +2080,56 @@ impl BinaryStoreStream {
         let Some(mut open) = self.open.take() else {
             return Ok(());
         };
-        open.rows.flush().map_err(write_err)?;
+        if let Some(rows) = &mut open.rows {
+            rows.flush().map_err(write_err)?;
+        }
         if let Some(starts) = &mut open.starts {
             starts.flush().map_err(write_err)?;
+        }
+        Ok(())
+    }
+
+    /// The rows scratch file of chromosome `number`, opened for writing at
+    /// its end (`open_numbered`).
+    fn rows_file(&self, number: usize, fresh: bool) -> Result<BufWriter<File>, PluginError> {
+        let path = numbered_path(&self.published.data, ROWS_ROLE, number);
+        Ok(BufWriter::with_capacity(
+            ROWS_BUFFER,
+            open_numbered(&path, fresh)?,
+        ))
+    }
+
+    /// Stops writing rows straight into the data file, for a chromosome
+    /// given again or out of start order: each chromosome's rows move from
+    /// the data file to its rows scratch file, the data file keeps its header
+    /// alone, and from here on the stream stores as [`Self::finish`] says.
+    fn leave_direct(&mut self) -> Result<(), PluginError> {
+        let Some(direct) = self.direct.take().map(into_unlocked) else {
+            return Ok(());
+        };
+        let (data, _) = direct.finish().map_err(write_err)?;
+        let mut read = File::open(&self.scratch.paths.data).map_err(write_err)?;
+        for (number, chromosome) in self.chromosomes.iter().enumerate() {
+            read.seek(io::SeekFrom::Start(chromosome.data_offset))
+                .map_err(read_err)?;
+            let mut rows = self.rows_file(number, true)?;
+            let moved =
+                io::copy(&mut (&mut read).take(chromosome.bytes), &mut rows).map_err(write_err)?;
+            rows.flush().map_err(write_err)?;
+            if moved != chromosome.bytes {
+                return Err(cut_short(&self.scratch.paths.data));
+            }
+        }
+        let header = BinaryStoreWriter::header_size(&self.column_names);
+        data.set_len(header).map_err(write_err)?;
+        (&self.scratch.data)
+            .seek(io::SeekFrom::Start(header))
+            .map_err(write_err)?;
+        if let Some(number) = self.open.as_ref().map(|open| open.number) {
+            let rows = self.rows_file(number, false)?;
+            if let Some(open) = &mut self.open {
+                open.rows = Some(rows);
+            }
         }
         Ok(())
     }
@@ -1722,7 +2153,7 @@ impl BinaryStoreStream {
     fn publish(&mut self, source: &ContentIdentity) -> Result<(u64, u64, u64), PluginError> {
         self.close_open()?;
         let mut order: Vec<usize> = (0..self.chromosomes.len()).collect();
-        if !self.chromosomes_as_given {
+        if self.direct.is_none() {
             order.sort_by(|&a, &b| self.chromosomes[a].name.cmp(&self.chromosomes[b].name));
         }
         for chromosome in &self.chromosomes {
@@ -1731,28 +2162,38 @@ impl BinaryStoreStream {
             }
         }
 
-        let mut data_offset = BinaryStoreWriter::header_size(&self.column_names);
-        for &number in &order {
-            self.chromosomes[number].data_offset = data_offset;
-            let rows_path = numbered_path(&self.published.data, ROWS_ROLE, number);
-            if self.chromosomes[number].in_order {
-                self.copy_rows(&rows_path, number)?;
-            } else {
-                self.copy_rows_by_start(&rows_path, number)?;
-            }
-            let _ = std::fs::remove_file(&rows_path);
-            data_offset += self.chromosomes[number].bytes;
-        }
-        let data_size = data_offset;
-        // Read back through the handle that holds the file's lock.
-        let data = ContentIdentity::of_handle(&self.scratch.data).map_err(|e| {
+        let data_path = self.scratch.paths.data.clone();
+        let unread = |e: io::Error| {
             PluginError::Init(format!(
                 "failed to read data file {}: {e}",
-                self.scratch.paths.data.display()
+                data_path.display()
             ))
-        })?;
+        };
+        let (data_size, data) = if let Some(direct) = self.direct.take().map(into_unlocked) {
+            let (file, sha256) = direct.finish().map_err(write_err)?;
+            let length = self.direct_bytes;
+            let sampled = sampled_digest(&file, length).map_err(unread)?;
+            (length, ContentIdentity::new(sha256, length, sampled))
+        } else {
+            let mut data_offset = BinaryStoreWriter::header_size(&self.column_names);
+            for &number in &order {
+                self.chromosomes[number].data_offset = data_offset;
+                let rows_path = numbered_path(&self.published.data, ROWS_ROLE, number);
+                if self.chromosomes[number].in_order {
+                    self.copy_rows(&rows_path, number)?;
+                } else {
+                    self.copy_rows_by_start(&rows_path, number)?;
+                }
+                let _ = std::fs::remove_file(&rows_path);
+                data_offset += self.chromosomes[number].bytes;
+            }
+            // Read back through the handle that holds the file's lock.
+            let data = ContentIdentity::of_handle(&self.scratch.data).map_err(unread)?;
+            (data_offset, data)
+        };
 
-        let mut idx_writer = BufWriter::new(HashingWriter::new(&self.scratch.index));
+        let index = self.scratch.index.try_clone().map_err(write_err)?;
+        let mut idx_writer = OffThreadWriter::new(index);
         idx_writer.write_all(VPDI_MAGIC).map_err(write_err)?;
         idx_writer
             .write_all(&INDEX_FORMAT_VERSION.to_le_bytes())
@@ -1794,19 +2235,22 @@ impl BinaryStoreStream {
 
             let starts_path = numbered_path(&self.published.data, STARTS_ROLE, number);
             if chromosome.entries > 0 {
-                let starts = File::open(&starts_path).map_err(|e| scratch_err(&starts_path, e))?;
-                let mut starts = BufReader::new(starts);
-                let mut entry = [0u8; ENTRY_BYTES];
-                for _ in 0..chromosome.entries {
-                    starts.read_exact(&mut entry).map_err(read_err)?;
-                    let (position, rest) = entry.split_at(8);
-                    let (offset, count) = rest.split_at(8);
-                    let offset = u64::from_le_bytes(offset.try_into().unwrap_or_default());
-                    idx_writer.write_all(position).map_err(write_err)?;
-                    idx_writer
-                        .write_all(&(chromosome.data_offset + offset).to_le_bytes())
-                        .map_err(write_err)?;
-                    idx_writer.write_all(count).map_err(write_err)?;
+                let mut starts =
+                    File::open(&starts_path).map_err(|e| scratch_err(&starts_path, e))?;
+                let mut chunk = vec![0u8; ENTRIES_CHUNK * ENTRY_BYTES];
+                let mut left = chromosome.entries;
+                while left > 0 {
+                    let taken = left.min(ENTRIES_CHUNK as u64);
+                    let bytes = &mut chunk[..taken as usize * ENTRY_BYTES];
+                    starts.read_exact(bytes).map_err(read_err)?;
+                    for entry in bytes.chunks_exact_mut(ENTRY_BYTES) {
+                        let offset =
+                            u64::from_le_bytes(entry[8..16].try_into().unwrap_or_default());
+                        entry[8..16]
+                            .copy_from_slice(&(chromosome.data_offset + offset).to_le_bytes());
+                    }
+                    idx_writer.write_all(bytes).map_err(write_err)?;
+                    left -= taken;
                 }
             }
             if open_group {
@@ -1820,12 +2264,9 @@ impl BinaryStoreStream {
             let _ = std::fs::remove_file(&starts_path);
         }
 
-        let hashed = idx_writer
-            .into_inner()
-            .map_err(|e| write_err(e.into_error()))?;
-        let (mut index_file, digest) = hashed.finish();
+        let (mut index_file, digest) = idx_writer.finish().map_err(write_err)?;
         let body_length = index_file.stream_position().map_err(write_err)?;
-        let sampled = sampled_digest(index_file, body_length).map_err(write_err)?;
+        let sampled = sampled_digest(&index_file, body_length).map_err(write_err)?;
         index_file.seek(io::SeekFrom::End(0)).map_err(write_err)?;
         for field in [&digest[..], &body_length.to_le_bytes(), &sampled] {
             index_file.write_all(field).map_err(write_err)?;
@@ -2422,12 +2863,7 @@ fn index_body<'a>(
     version: u32,
     whole: bool,
 ) -> Result<&'a [u8], PluginError> {
-    let refusal = |difference: std::fmt::Arguments| {
-        PluginError::Init(format!(
-            "store index differs from its own digest: the index file {} {difference}; {RECONVERT}",
-            index_path.display()
-        ))
-    };
+    let refusal = |difference: std::fmt::Arguments| index_refusal(index_path, difference);
     let Some((body, recorded)) = bytes.split_last_chunk::<INDEX_DIGEST_BYTES>() else {
         return Err(refusal(format_args!(
             "holds {} bytes, fewer than the {INDEX_DIGEST_BYTES} of the digest it ends with",
@@ -2466,17 +2902,142 @@ fn index_body<'a>(
         }
         (body, recorded)
     };
-    let found = HashingReader::new(body).digest_to_end().map_err(read_err)?;
+    let found = whole_digest(version, body);
     if found != *recorded {
-        return Err(refusal(format_args!(
-            "has SHA256 {} before its last {} bytes, which record {}",
-            hex(&found),
+        return Err(digest_refusal(
+            index_path,
+            &found,
             bytes.len() - body.len(),
-            hex(recorded)
-        )));
+            recorded,
+        ));
     }
     Ok(body)
 }
+
+/// The refusal of the index at `index_path` for `difference` from its own
+/// trailer.
+fn index_refusal(index_path: &Path, difference: std::fmt::Arguments) -> PluginError {
+    PluginError::Init(format!(
+        "store index differs from its own digest: the index file {} {difference}; {RECONVERT}",
+        index_path.display()
+    ))
+}
+
+/// The refusal of an index whose bytes before its last `trailer` bytes have
+/// the digest `found` where those bytes record `recorded`.
+fn digest_refusal(
+    index_path: &Path,
+    found: &Digest,
+    trailer: usize,
+    recorded: &Digest,
+) -> PluginError {
+    index_refusal(
+        index_path,
+        format_args!(
+            "has SHA256 {} before its last {trailer} bytes, which record {}",
+            hex(found),
+            hex(recorded)
+        ),
+    )
+}
+
+/// The refusal of an index whose positions of chromosome `name` hold
+/// `position` after `previous`.
+fn unordered(name: &str, position: u64, previous: u64) -> PluginError {
+    PluginError::Init(format!(
+        "index positions of chromosome {name:.32} do not ascend: {position} follows \
+         {previous}; {RECONVERT}"
+    ))
+}
+
+/// `verify`'s whole check of a version 6 index, `mapped` the bytes an open
+/// checked by their trailer, read once in order through `file`, the handle
+/// they were mapped from, so its pages stay out of the process's mapping:
+/// the bytes before the trailer are refused unless they have the chunked
+/// SHA256 it records, and otherwise the first position found below or at
+/// the one before it in its chromosome is returned, as the refusal
+/// `load_index` words for it. A table the walk cannot read is left to
+/// `load_index`, which refuses it.
+fn check_index_whole(
+    mapped: &[u8],
+    file: &File,
+    index_path: &Path,
+) -> Result<Option<PluginError>, PluginError> {
+    let body_length = mapped.len().saturating_sub(INDEX_TRAILER_BYTES);
+    let recorded: Digest = mapped[body_length..]
+        .first_chunk::<INDEX_DIGEST_BYTES>()
+        .copied()
+        .unwrap_or_default();
+    (&*file).seek(io::SeekFrom::Start(0)).map_err(read_err)?;
+    let mut read = Hashed {
+        inner: BufReader::with_capacity(READ_BYTES, file).take(body_length as u64),
+        hashed: ChunkedSha256::new(io::sink()),
+    };
+    let first_unordered = unordered_entry(&mut read).unwrap_or(None);
+    io::copy(&mut read, &mut io::sink()).map_err(read_err)?;
+    let found = read.hashed.finish().1;
+    if found != recorded {
+        return Err(digest_refusal(
+            index_path,
+            &found,
+            INDEX_TRAILER_BYTES,
+            &recorded,
+        ));
+    }
+    Ok(first_unordered.map(|(name, position, previous)| unordered(&name, position, previous)))
+}
+
+/// The first position of a version 6 index's chromosome table read from
+/// `read` that lies at or below the one before it, with its chromosome and
+/// that one.
+fn unordered_entry(read: &mut impl IoRead) -> io::Result<Option<(String, u64, u64)>> {
+    let mut head = [0u8; 4 + 4 + Layout::BYTES + 2 * (32 + 8 + 32) + 4];
+    read.read_exact(&mut head)?;
+    let chromosomes = u32::from_le_bytes(head[head.len() - 4..].try_into().unwrap_or_default());
+    let mut entries = vec![0u8; ENTRIES_READ * POSITION_ENTRY_BYTES];
+    for _ in 0..chromosomes {
+        let mut length = [0u8; 2];
+        read.read_exact(&mut length)?;
+        let mut name = vec![0u8; usize::from(u16::from_le_bytes(length))];
+        read.read_exact(&mut name)?;
+        let mut counts = [0u8; 16];
+        read.read_exact(&mut counts)?;
+        let mut left = u64::from_le_bytes(counts[8..].try_into().unwrap_or_default());
+        let mut previous: Option<u64> = None;
+        while left > 0 {
+            let taken = left.min(ENTRIES_READ as u64);
+            let batch = &mut entries[..taken as usize * POSITION_ENTRY_BYTES];
+            read.read_exact(batch)?;
+            for entry in batch.chunks_exact(POSITION_ENTRY_BYTES) {
+                let position = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
+                if let Some(previous) = previous.filter(|&previous| position <= previous) {
+                    let name = String::from_utf8_lossy(&name).into_owned();
+                    return Ok(Some((name, position, previous)));
+                }
+                previous = Some(position);
+            }
+            left -= taken;
+        }
+    }
+    Ok(None)
+}
+
+/// A reader taking the chunked SHA256 of every byte it reads.
+struct Hashed<R> {
+    inner: R,
+    hashed: ChunkedSha256<io::Sink>,
+}
+
+impl<R: IoRead> IoRead for Hashed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hashed.write_all(&buf[..read])?;
+        Ok(read)
+    }
+}
+
+/// The position entries one read of [`check_index_whole`] takes.
+const ENTRIES_READ: usize = READ_BYTES / POSITION_ENTRY_BYTES;
 
 /// `count` of `unit`s as the `u16` a store's length or count field records, or
 /// the refusal naming `what` with the count.
@@ -2578,9 +3139,9 @@ mod tests {
     const DIGEST_BYTES: usize = INDEX_TRAILER_BYTES;
 
     /// `body` followed by the trailer the writer ends an index with: the
-    /// SHA256 of its bytes, their count and their sampled digest.
+    /// chunked SHA256 of its bytes, their count and their sampled digest.
     fn sealed(body: &[u8]) -> Vec<u8> {
-        let digest = HashingReader::new(body).digest_to_end().unwrap();
+        let digest = chunked_sha256(body);
         let length = body.len() as u64;
         let sampled = sampled_digest(io::Cursor::new(body), length).unwrap();
         [body, &digest[..], &length.to_le_bytes(), &sampled[..]].concat()
@@ -2630,6 +3191,69 @@ mod tests {
             },
             source,
         )
+    }
+
+    /// The chunked SHA256 by its definition, computed one chunk after
+    /// another: the SHA256 of the prefix, the chunk size and each chunk's
+    /// SHA256 in order.
+    fn serial_chunked(bytes: &[u8], chunk_bytes: usize) -> Digest {
+        let sha = |bytes: &[u8]| HashingReader::new(bytes).digest_to_end().unwrap();
+        let mut root = CHUNKED_PREFIX.to_vec();
+        root.extend_from_slice(&(chunk_bytes as u64).to_le_bytes());
+        for chunk in bytes.chunks(chunk_bytes) {
+            root.extend_from_slice(&sha(chunk));
+        }
+        sha(&root)
+    }
+
+    /// A chunked SHA256 equals its serial definition at every chunk
+    /// boundary: no byte, one byte, exactly one chunk, one byte over it and
+    /// several chunks, whether taken of bytes in memory or written in pieces
+    /// that straddle the chunks. It is not the bytes' SHA256, and a change in
+    /// a middle chunk changes it.
+    #[test]
+    fn a_chunked_sha256_equals_its_serial_definition_at_every_chunk_boundary() {
+        const CHUNK: usize = 64;
+        let bytes: Vec<u8> = (0..10 * CHUNK + 7).map(|i| (i * 31 % 251) as u8).collect();
+        for length in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK, 10 * CHUNK + 7] {
+            let bytes = &bytes[..length];
+            let expected = serial_chunked(bytes, CHUNK);
+            assert_eq!(chunked_sha256_in(bytes, CHUNK), expected, "{length} bytes");
+            for piece in [1, 5, CHUNK, 3 * CHUNK + 2] {
+                let mut written = ChunkedSha256::with_chunks(Vec::new(), CHUNK);
+                for part in bytes.chunks(piece) {
+                    written.write_all(part).unwrap();
+                }
+                let (inner, digest) = written.finish();
+                assert_eq!(inner, bytes, "{length} bytes in pieces of {piece}");
+                assert_eq!(digest, expected, "{length} bytes in pieces of {piece}");
+            }
+            let plain = HashingReader::new(bytes).digest_to_end().unwrap();
+            assert_ne!(expected, plain, "{length} bytes");
+        }
+        let mut changed = bytes.clone();
+        changed[5 * CHUNK + 3] ^= 1;
+        assert_ne!(
+            chunked_sha256_in(&changed, CHUNK),
+            chunked_sha256_in(&bytes, CHUNK)
+        );
+        // A writer on the only thread of a pool hashes there, where waiting
+        // for a job of that pool would never end.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let on_pool = pool.install(|| {
+            let mut written = ChunkedSha256::with_chunks(io::sink(), CHUNK);
+            written.write_all(&bytes).unwrap();
+            written.finish().1
+        });
+        assert_eq!(on_pool, serial_chunked(&bytes, CHUNK));
+        // The store's own chunks: no byte and one byte, which lie in no chunk
+        // and in one chunk shorter than the rest.
+        for bytes in [&b""[..], &b"x"[..]] {
+            assert_eq!(chunked_sha256(bytes), serial_chunked(bytes, CHUNK_BYTES));
+        }
     }
 
     #[test]
@@ -3489,7 +4113,7 @@ mod tests {
         };
         let table_bytes = std::fs::read(&table).unwrap();
         let data_bytes = std::fs::read(&vpd_path).unwrap();
-        let digest = |bytes: &[u8]| hex(&HashingReader::new(bytes).digest_to_end().unwrap());
+        let digest = |bytes: &[u8]| hex(&chunked_sha256(bytes));
         let sample = |bytes: &[u8]| {
             hex(&sampled_digest(io::Cursor::new(bytes), bytes.len() as u64).unwrap())
         };
@@ -3618,15 +4242,17 @@ mod tests {
         assert!(BinaryAnnotator::open(&vpd_path, &config).is_err());
 
         // The same index as version 5 writes it, without the two sampled
-        // digests, is held to the whole table's SHA256 on every open.
+        // digests and with the plain SHA256 of each file, is held to the
+        // whole table's SHA256 on every open, and `verify` holds it to the
+        // plain SHA256 of both files.
         let vpdi_path = vpd_path.with_extension("vpdi");
         let index = std::fs::read(&vpdi_path).unwrap();
         let body = &index[..index.len() - DIGEST_BYTES];
         let mut v5 = body[..IDENTITY_AT].to_vec();
         v5[4..8].copy_from_slice(&5u32.to_le_bytes());
-        for identity in 0..2 {
-            let at = IDENTITY_AT + identity * IDENTITY_BYTES;
-            v5.extend_from_slice(&body[at..at + 32 + 8]);
+        for file in [&bytes, &std::fs::read(&vpd_path).unwrap()] {
+            v5.extend_from_slice(&HashingReader::new(&file[..]).digest_to_end().unwrap());
+            v5.extend_from_slice(&(file.len() as u64).to_le_bytes());
         }
         v5.extend_from_slice(&body[IDENTITY_AT + 2 * IDENTITY_BYTES..]);
         let v5_digest = HashingReader::new(&v5[..]).digest_to_end().unwrap();
@@ -3634,6 +4260,7 @@ mod tests {
         std::fs::write(&table, &bytes).unwrap();
         let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
         assert_eq!(store.query("21", 200, 200).unwrap().len(), 1);
+        BinaryAnnotator::verify(&vpd_path, &table).unwrap();
         std::fs::write(&table, &middle).unwrap();
         let refused = BinaryAnnotator::open(&vpd_path, &config)
             .err()
@@ -4229,7 +4856,52 @@ mod tests {
                      ascend: {follows}; {RECONVERT}"
                 ))
             );
+            // An index whose digest is wrong as well is refused by its digest,
+            // which `verify` holds it to before its order.
+            let mut index = std::fs::read(&vpdi_path).unwrap();
+            let digest_at = index.len() - DIGEST_BYTES;
+            index[digest_at] ^= 1;
+            std::fs::write(&vpdi_path, &index).unwrap();
+            let refused = BinaryAnnotator::verify(&vpd_path, &config.file_path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refused.starts_with(
+                    "plugin initialization failed: store index differs from its own digest"
+                ),
+                "{positions:?}: {refused}"
+            );
         }
+    }
+
+    /// `verify`'s order walk reads a chromosome's entries in batches and
+    /// finds a position out of order past the first batch, in a later
+    /// chromosome, naming it and the position before it; an ordered table has
+    /// none.
+    #[test]
+    fn the_order_walk_finds_a_position_out_of_order_past_its_first_batch() {
+        let table = |unordered_at: Option<u64>| {
+            let mut bytes = vec![0u8; 4 + 4 + Layout::BYTES + 2 * (32 + 8 + 32)];
+            bytes.extend(2u32.to_le_bytes());
+            for (name, count) in [("1", 3u64), ("22", ENTRIES_READ as u64 + 2)] {
+                bytes.extend((name.len() as u16).to_le_bytes());
+                bytes.extend(name.as_bytes());
+                bytes.extend(0u64.to_le_bytes());
+                bytes.extend(count.to_le_bytes());
+                for i in 0..count {
+                    let position = match unordered_at {
+                        Some(at) if name == "22" && i == at => 5,
+                        _ => 10 + i,
+                    };
+                    bytes.extend(position.to_le_bytes());
+                    bytes.extend([0u8; 12]);
+                }
+            }
+            unordered_entry(&mut &bytes[..]).unwrap()
+        };
+        assert_eq!(table(None), None);
+        let at = ENTRIES_READ as u64 + 1;
+        assert_eq!(table(Some(at)), Some(("22".to_string(), 5, 10 + at - 1)));
     }
 
     /// Both scratch files are created before the earlier store's index is
@@ -4874,6 +5546,73 @@ mod tests {
         assert_eq!(ties, ["three-0", "three-1000", "three-2000"]);
     }
 
+    /// A stream whose chromosomes each come in one run in start order, as a
+    /// table `tabix` indexes holds them, stores them in the order given, as
+    /// `write` stores what it is given: the two stores are equal byte for
+    /// byte and the whole-file check passes. Each chromosome holds more rows
+    /// than the rows buffer takes. A chromosome that leaves start order after
+    /// others were stored makes the stream store every chromosome by name.
+    #[test]
+    fn chromosomes_streamed_in_order_are_stored_in_the_order_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpd_path = dir.path().join("given.vpd");
+        let reference = dir.path().join("reference.vpd");
+        let column_names: Vec<String> = ["chr", "start", "end", "name"].map(String::from).to_vec();
+        let (config, source) = with_source(&vpd_path, TabixConfig::default());
+        let mut rows = Vec::new();
+        for chr in ["2", "10", "1"] {
+            for i in 0..3000u64 {
+                rows.push(named_row(
+                    chr,
+                    10 + i / 2,
+                    10 + i / 2,
+                    &format!("{chr}-{i}"),
+                ));
+            }
+        }
+        let mut given: Vec<(String, Vec<TabixRecord>)> = Vec::new();
+        for row in &rows {
+            match given.last_mut() {
+                Some((chr, held)) if *chr == row.chr => held.push(row.clone()),
+                _ => given.push((row.chr.clone(), vec![row.clone()])),
+            }
+        }
+
+        let written = streamed(&vpd_path, &column_names, &rows, &config, &source);
+        let expected = BinaryStoreWriter::new(reference.clone())
+            .write(&column_names, &given, &config, &source)
+            .unwrap();
+        assert_eq!(written, expected);
+        assert!(written.1 > 2 * ROWS_BUFFER as u64);
+        assert!(store_bytes(&vpd_path) == store_bytes(&reference));
+        BinaryAnnotator::verify(&vpd_path, &config.file_path).unwrap();
+        let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
+        let names = |chr: &str| -> Vec<String> {
+            let found = store.query(chr, 12, 12).unwrap();
+            found.into_iter().map(|r| r.columns[3].clone()).collect()
+        };
+        assert_eq!(names("10"), ["10-4", "10-5"]);
+
+        rows.push(named_row("1", 5, 5, "1-below"));
+        let written = streamed(&vpd_path, &column_names, &rows, &config, &source);
+        let expected = BinaryStoreWriter::new(reference.clone())
+            .write(&column_names, &grouped_by_start(&rows), &config, &source)
+            .unwrap();
+        assert_eq!(written, expected);
+        assert!(store_bytes(&vpd_path) == store_bytes(&reference));
+        BinaryAnnotator::verify(&vpd_path, &config.file_path).unwrap();
+        assert_eq!(
+            entries(dir.path()),
+            [
+                "given.table",
+                "given.vpd",
+                "given.vpdi",
+                "reference.vpd",
+                "reference.vpdi"
+            ]
+        );
+    }
+
     /// A chromosome given in two separate runs of rows is one chromosome of
     /// the store: the rows of a start that both runs carry form one position,
     /// in the order given, and a second run lying below the first is sorted
@@ -5143,7 +5882,8 @@ mod tests {
             .unwrap();
         std::mem::forget(stream);
         let left = entries(dir.path());
-        for role in ["data", "rows.0", "starts.0"] {
+        // Rows in start order go straight into the data scratch file.
+        for role in ["data", "starts.0"] {
             let name = format!("kept.vpd.{}.{role}.partial", std::process::id());
             assert!(left.contains(&name), "{name} is not among {left:?}");
         }

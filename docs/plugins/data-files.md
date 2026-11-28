@@ -135,15 +135,17 @@ data path and `.vpdi` path that name one file through a link, are refused.
 The converter reads the data file once and writes each row as it reads it, so
 it keeps no row in memory while it reads: for each chromosome it holds the
 name and a few counts. While it runs it needs room beside the output for the
-store and the rows of one chromosome more, in scratch files it removes.
+store and 20 bytes for each distinct start, in scratch files it removes. A
+data file that gives a chromosome in two runs, or a row below the start
+before it, needs room for the rows read up to there once more.
 
 The converter writes each file whole under a scratch name beside its own and
 renames it into place, the data first and the index last. A run that starts
 while the files are written therefore finds no part-written store. A scratch
 name ends in the converter's process id, a role and `.partial`. The two files
 have the roles `data` and `index`. What the converter keeps of each chromosome
-while it reads has the roles `rows`, `starts` and `spans`, each followed by
-the chromosome's number.
+while it reads has the role `starts` and, in a data file not sorted by
+chromosome and start, `rows`, each followed by the chromosome's number.
 
 An earlier store's index is removed once both scratch files are written
 whole, before they are renamed. A conversion that is refused or fails before
@@ -173,8 +175,10 @@ that rebuilds it. Beside a data file with no index, a refusal that names the
 conversion ends with `--no-verify`, the flag the conversion needs on such a
 file.
 
-The store's index also records the length, the SHA256 and a sampled digest of
-the data file it was built from and of its own `.vpd` file. The sampled digest
+The store's index also records the length, a chunked SHA256 and a sampled
+digest of the data file it was built from and of its own `.vpd` file. The
+chunked SHA256 is the SHA256 of the SHA256 of each 64 MiB of the file, taken
+side by side, so it does not equal the file's `sha256sum`. The sampled digest
 is the SHA256 of a file's first and last MiB. Every open compares the lengths
 and the sampled digests. A plugin refuses a store whose data file differs from
 that record, as a data file replaced under the same name does. It refuses a
@@ -184,7 +188,7 @@ does.
 An open reads only those two MiB of each file. A change that keeps a file's
 length and lies wholly between its first and last MiB is not seen by an open,
 and the plugin reads the store as it stands. The converter's check reads both
-files whole and refuses such a change by their SHA256:
+files whole and refuses such a change by their chunked SHA256:
 
 ```bash
 vep-cache-converter verify --store <file>.vpd --table <data file>
@@ -194,12 +198,13 @@ Run it after copying or restoring a store, or whenever a data file may have
 been edited in place. A store whose index is of version 5, which records no
 sampled digest, is held to the whole files' SHA256 on every open.
 
-The index ends with its own length, the SHA256 of its bytes and a sampled
+The index ends with its own length, the chunked SHA256 of its bytes and a sampled
 digest of its first and last MiB. Every open checks the length and the sampled
 digest, so a plugin refuses an index cut short, or altered in those MiB. An
 index altered at the same length between them opens; `verify` checks the
-index's full SHA256 too and refuses it. A version 5 index is held to its full
-SHA256 on every open.
+chunked SHA256 of the whole index too and refuses it. A version 5 index
+records the plain SHA256 of each file and of itself, and is held to them on
+every open.
 
 The converter refuses to write positions out of ascending order, and `verify`
 refuses an index that holds them. An open of a version 6 index does not read
@@ -214,7 +219,7 @@ positions out of ascending order.
 The warning names the store, the data file and what differs. The
 data file is read through tabix, so the answer is the data file's either way.
 An `INFO` line names what each plugin reads: the store, with the data file's
-path and both SHA256 values, or the data file.
+path and both whole-file digests, or the data file.
 
 The data file must stay beside its store: each open reads the first and last
 MiB of the data file, the store's `.vpd` and its index to check them, which

@@ -1006,10 +1006,10 @@ pub(crate) fn tabix_contig_order(
 /// records of in a row and, when
 /// the input's index gives the contig order, the ones after it as far as
 /// `--prewarm_ahead` says (one by default; under `all` the whole order is
-/// queued as the reader starts). One load at a time keeps the parse's
-/// transient memory to a single chromosome. A load that fails here is not
-/// reported: the batch's own warm-up loads the same chromosome again and meets
-/// the same error.
+/// queued as the reader starts). [`PREWARM_LOADS`] loads run at a time, so one
+/// chromosome's merge, which runs on its helper alone, overlaps the next one's
+/// shard reads and parse. A load that fails here is not reported: the batch's
+/// own warm-up loads the same chromosome again and meets the same error.
 struct Prewarmer<'env> {
     transcripts: &'env LazyTranscriptIndexes,
     synonyms: &'env ChromosomeSynonyms,
@@ -1029,14 +1029,21 @@ impl<'env> Prewarmer<'env> {
         ahead: PrewarmAhead,
     ) -> Self {
         let (queue, requests) = mpsc::channel::<String>();
-        thread::Builder::new()
-            .name("vep-prewarm".into())
-            .spawn_scoped(scope, move || {
-                for chr in requests {
+        let requests = Arc::new(Mutex::new(requests));
+        for _ in 0..PREWARM_LOADS {
+            let requests = Arc::clone(&requests);
+            thread::Builder::new()
+                .name("vep-prewarm".into())
+                .spawn_scoped(scope, move || loop {
+                    let next = requests
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                    let Ok(chr) = next else { break };
                     let _ = prewarm_chromosome(transcripts, regulatory, &chr);
-                }
-            })
-            .expect("spawn the prewarm thread");
+                })
+                .expect("spawn the prewarm thread");
+        }
         let mut prewarmer = Self {
             transcripts,
             synonyms,
@@ -1078,6 +1085,11 @@ impl<'env> Prewarmer<'env> {
         let _ = self.queue.send(chr.to_string());
     }
 }
+
+/// The chromosome loads the [`Prewarmer`] runs at a time: a second load reads
+/// and parses while the first merges, and each more holds another
+/// chromosome's parse in memory.
+const PREWARM_LOADS: usize = 2;
 
 /// The records a reader counts on one chromosome in a row before it warms the
 /// whole chromosome ahead of the batches: a sorted input that dense is cheaper
@@ -9515,6 +9527,50 @@ mod tests {
                 vec!["20".to_string(), "21".to_string(), "22".to_string()]
             )
         );
+    }
+
+    /// A chromosome the helper queued loads while another chromosome's load
+    /// still waits on its shard, so one chromosome's merge overlaps the next
+    /// one's reads; every queued chromosome is loaded once the helper ends.
+    #[cfg(unix)]
+    #[test]
+    fn prewarmer_loads_a_queued_chromosome_while_another_load_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = |chr: &str| dir.path().join("transcripts").join(chr).join("1-1000.json");
+        for chr in ["20", "21"] {
+            std::fs::create_dir_all(shard(chr).parent().unwrap()).unwrap();
+        }
+        // A FIFO holds the load of `20` until the test writes the shard.
+        let made = std::process::Command::new("mkfifo")
+            .arg(shard("20"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        std::fs::write(shard("21"), "[]").unwrap();
+        let transcripts = LazyTranscriptIndexes::new(dir.path().to_str().unwrap(), 0, 0).unwrap();
+        let no_synonyms = ChromosomeSynonyms::new();
+        let order = ["20".to_string(), "21".to_string()];
+        let overlapped = thread::scope(|scope| {
+            let prewarmer = Prewarmer::spawn(
+                scope,
+                &transcripts,
+                None,
+                &no_synonyms,
+                &order,
+                PrewarmAhead::All,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while transcripts.loaded_whole("21").is_none() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let overlapped = transcripts.loaded_whole("21").is_some();
+            std::fs::write(shard("20"), "[]").unwrap();
+            drop(prewarmer);
+            overlapped
+        });
+        assert!(overlapped, "21 waited for the load of 20");
+        assert!(transcripts.loaded_whole("20").is_some());
+        assert!(transcripts.loaded_whole("21").is_some());
     }
 
     /// The reader takes its next batch's buffers from the return channel.
