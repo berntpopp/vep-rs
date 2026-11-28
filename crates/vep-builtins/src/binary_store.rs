@@ -579,11 +579,19 @@ impl VpdIndex {
     /// Refuses a data file `data`, or a table at `table`, whose whole digest
     /// ([`whole_digest`]) is not the one the index records, naming which;
     /// both are read whole, the chunks of a version 6 index hashed side by
-    /// side.
-    fn check_whole(&self, vpd_path: &Path, data: &[u8], table: &Path) -> Result<(), PluginError> {
+    /// side. The data file is read through `data`, the handle its mapping
+    /// was made from, so its pages stay out of the process's mapping.
+    fn check_whole(&self, vpd_path: &Path, data: &File, table: &Path) -> Result<(), PluginError> {
         let (data_binding, source_binding) = bindings(vpd_path, table);
-        self.data
-            .same_digest(&whole_digest(self.version, data), &data_binding)?;
+        let data_digest = if self.version == UNSAMPLED_INDEX_VERSION {
+            (&*data)
+                .seek(io::SeekFrom::Start(0))
+                .and_then(|_| HashingReader::new(data).digest_to_end())
+        } else {
+            ContentIdentity::of_handle(data).map(|identity| identity.sha256)
+        }
+        .map_err(read_err)?;
+        self.data.same_digest(&data_digest, &data_binding)?;
         let unreadable = |e| unreadable_table(table, e);
         let found = if self.version == UNSAMPLED_INDEX_VERSION {
             let file = File::open(table).map_err(unreadable)?;
@@ -640,6 +648,8 @@ fn unreadable_table(table: &Path, e: io::Error) -> PluginError {
 struct StoreFiles {
     index: Mmap,
     data: Mmap,
+    /// The handle `data` was mapped from.
+    data_file: File,
 }
 
 impl StoreFiles {
@@ -691,7 +701,11 @@ impl StoreFiles {
                 vpd_path.display()
             ))
         })?;
-        Ok(Self { index, data })
+        Ok(Self {
+            index,
+            data,
+            data_file: file,
+        })
     }
 }
 
@@ -752,7 +766,7 @@ impl BinaryAnnotator {
         let files = StoreFiles::read(vpd_path)?;
         let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"), true)?;
         index.check_sampled(vpd_path, &files.data, table)?;
-        index.check_whole(vpd_path, &files.data, table)
+        index.check_whole(vpd_path, &files.data_file, table)
     }
 
     /// Whether the store at `vpd_path` has both its files and an index of
@@ -873,7 +887,7 @@ impl BinaryAnnotator {
         let table = &config.file_path;
         index.check_sampled(vpd_path, &files.data, table)?;
         if index.version == UNSAMPLED_INDEX_VERSION {
-            index.check_whole(vpd_path, &files.data, table)?;
+            index.check_whole(vpd_path, &files.data_file, table)?;
         }
 
         let (column_names, _header_end) = Self::parse_data_header(&files.data)?;
