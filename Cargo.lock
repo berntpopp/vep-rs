@@ -2838,6 +2838,7 @@ dependencies = [
  "flate2",
  "indexmap",
  "libc",
+ "libdeflater",
  "mimalloc",
  "noodles",
  "noodles-bgzf",

@@ -1481,12 +1481,45 @@ pub(crate) fn read_shard(path: &Path, manifest: &CacheManifest) -> anyhow::Resul
     let raw = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
     manifest.verify_bytes(path, &raw).map_err(manifest_error)?;
     if path.extension().is_some_and(|e| e == "gz") {
+        if let Some(out) = gunzip_whole(&raw) {
+            return Ok(out);
+        }
+        // flate2 reads, or refuses in its own words, what libdeflate gave up on.
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut out)
             .with_context(|| format!("Failed to inflate {}", path.display()))?;
         return Ok(out);
     }
     Ok(raw)
+}
+
+/// The first gzip member of `raw`, inflated in one libdeflate call as flate2's
+/// `GzDecoder` reads it; `None` where libdeflate refuses the buffer, or where
+/// the header carries a CRC (FHCRC), which flate2 checks and libdeflate skips.
+fn gunzip_whole(raw: &[u8]) -> Option<Vec<u8>> {
+    const FHCRC: u8 = 0x02;
+    if raw.get(3).is_none_or(|flags| flags & FHCRC != 0) {
+        return None;
+    }
+    // DEFLATE expands at most 1032-fold; ISIZE, the last member's length
+    // mod 2^32, is only the first guess.
+    let limit = raw.len().saturating_mul(1032);
+    let isize = u32::from_le_bytes(raw.last_chunk::<4>()?.to_owned()) as usize;
+    let mut size = isize.min(limit);
+    let mut decompressor = libdeflater::Decompressor::new();
+    loop {
+        let mut out = vec![0; size];
+        match decompressor.gzip_decompress(raw, &mut out) {
+            Ok(len) => {
+                out.truncate(len);
+                return Some(out);
+            }
+            Err(libdeflater::DecompressionError::InsufficientSpace) if size < limit => {
+                size = size.saturating_mul(2).max(1 << 16).min(limit);
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Parse a shard's transcripts from either shard shape.
@@ -2403,6 +2436,86 @@ mod tests {
     /// A manifest that checks nothing, for the shards these tests write.
     fn unchecked() -> CacheManifest {
         CacheManifest::absent("")
+    }
+
+    /// Gzip shapes a `.json.gz` shard can take: one member, two members, a
+    /// last member whose ISIZE understates the first, an empty payload, and the
+    /// broken ones (empty file, header only, truncated, bad CRC, a wrong header
+    /// CRC under FHCRC, trailing garbage).
+    fn gzip_fixtures() -> Vec<(&'static str, Vec<u8>)> {
+        let gz = |data: &[u8]| {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let big: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| format!("{{\"n\":{i}}},").into_bytes())
+            .collect();
+        let one = gz(&big);
+        let mut bad_crc = one.clone();
+        let at = bad_crc.len() - 8;
+        bad_crc[at] ^= 0xff;
+        let mut fhcrc = one[..10].to_vec();
+        fhcrc[3] |= 0x02;
+        fhcrc.extend_from_slice(&[0xde, 0xad]);
+        fhcrc.extend_from_slice(&one[10..]);
+        vec![
+            ("one member", one.clone()),
+            ("two members", [gz(b"[1,"), gz(b"2]")].concat()),
+            ("understated ISIZE", [one.clone(), gz(b"x")].concat()),
+            ("empty payload", gz(b"")),
+            (
+                "trailing garbage",
+                [one.clone(), b"garbage".to_vec()].concat(),
+            ),
+            ("empty file", Vec::new()),
+            ("header only", one[..10].to_vec()),
+            ("truncated", one[..one.len() - 9].to_vec()),
+            ("bad CRC", bad_crc),
+            ("wrong header CRC", fhcrc),
+        ]
+    }
+
+    /// A `.json.gz` shard reads as flate2's `GzDecoder` read it, bytes and
+    /// refusal text alike, whichever inflater does the work.
+    #[test]
+    fn a_gzip_shard_reads_as_flate2_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-1000000.json.gz");
+        for (name, raw) in gzip_fixtures() {
+            std::fs::write(&path, &raw).unwrap();
+            let mut expected = Vec::new();
+            let expected = std::io::Read::read_to_end(
+                &mut flate2::read::GzDecoder::new(&raw[..]),
+                &mut expected,
+            )
+            .map(|_| expected)
+            .map_err(|e| format!("Failed to inflate {}: {e}", path.display()));
+            let got = read_shard(&path, &unchecked()).map_err(|e| format!("{e:#}"));
+            assert_eq!(got, expected, "{name}");
+        }
+    }
+
+    /// libdeflate inflates a whole gzip buffer's first member, growing past an
+    /// ISIZE that understates it, and gives up on what flate2 must judge.
+    #[test]
+    fn libdeflate_inflates_the_first_member_or_gives_up() {
+        for (name, raw) in gzip_fixtures() {
+            let mut reference = Vec::new();
+            let reference = std::io::Read::read_to_end(
+                &mut flate2::read::GzDecoder::new(&raw[..]),
+                &mut reference,
+            )
+            .map(|_| reference);
+            let fast = gunzip_whole(&raw);
+            match name {
+                "one member" | "two members" | "understated ISIZE" | "empty payload"
+                | "trailing garbage" => {
+                    assert_eq!(fast, Some(reference.unwrap()), "{name}")
+                }
+                _ => assert_eq!(fast, None, "{name}"),
+            }
+        }
     }
 
     /// A directory without `transcripts/`, or whose `transcripts/` holds no

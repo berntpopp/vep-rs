@@ -51,6 +51,9 @@ memmap2 = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 flate2 = "1"
+# Whole-buffer gzip inflate of `.json.gz` cache shards; already linked through
+# noodles-bgzf's `libdeflate` feature and bigtools.
+libdeflater = "1.26"
 
 # Parallelism
 rayon = "1.10"
