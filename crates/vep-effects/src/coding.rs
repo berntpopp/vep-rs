@@ -8495,6 +8495,25 @@ mod tests {
     /// (Trp under code 2) and `GCA` to the code-2 stop `AGA`, so the alternate
     /// peptide is `TrpAla`; the standard code stops at the `TGA` at once and
     /// leaves it empty. The reference peptide ends before residue 4 either way.
+    /// The alternate translation is read once for each span: asked again at
+    /// the same span it is the translation of the alternate CDS, and once the
+    /// span moves it is that of the new span's alternate CDS.
+    #[test]
+    fn the_alternate_translation_follows_the_span() {
+        let tx = make_single_exon_transcript(Strand::Forward, "ATGGCTAAATAA", "TGAGCAAGACCCTAA");
+        let variant = deletion_of_cds(&tx, 4, 6, "GCT");
+        let mut ev = PerlCodingEval::new(&variant, &tx, variant.start, variant.end, None).unwrap();
+        let fresh =
+            |ev: &PerlCodingEval<'_>| ev.alternate_cds().map(|cds| perl_translate(&cds, ev.table));
+        let first = ev.alternate_translation();
+        assert_eq!(first, fresh(&ev));
+        assert_eq!(ev.alternate_translation(), first);
+        let moved = deletion_of_cds(&tx, 7, 9, "AAA");
+        ev.span = perl_span(&tx, moved.start, moved.end).unwrap();
+        assert_eq!(ev.alternate_translation(), fresh(&ev));
+        assert_ne!(ev.alternate_translation(), first);
+    }
+
     #[test]
     fn del_peptides_follow_the_transcripts_table() {
         for (table, alt) in [(2u8, &b"TrpAla"[..]), (1, &b""[..])] {
