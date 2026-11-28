@@ -3462,3 +3462,117 @@ fn the_shift_an_earlier_allele_left_takes_the_codons_of_an_insertion_read_at_the
         assert!(!taken, "{name}");
     }
 }
+
+/// A later allele's Consequence read from the peptides at the moved pair and its HGVSp
+/// written at its own shift from an allele Ensembl VEP left unrotated
+/// (TranscriptVariationAllele.pm:798-830, :1337-1339, :1724-1733), as
+/// `tools/vep-formats-compare` takes them on ATXN1's `chr6 16327676 T TGCT,TGCTGCTGCT`.
+/// The terms are taken where the two peptide pairs give them; an HGVSp only on a reverse
+/// strand, where the two engines' turns of the allele differ.
+#[test]
+fn the_shift_an_earlier_allele_left_takes_a_later_allele_s_terms_and_unrotated_hgvsp() {
+    let (_cache, sequences) = sequences_of("shared-shift-terms");
+    type Later<'a> = (&'a str, [&'a str; 4], &'a str);
+    let judged = |location: &str,
+                  feature: &str,
+                  strand: &str,
+                  alleles: [&str; 2],
+                  record: &str,
+                  reference: Later,
+                  candidate: Later,
+                  offset: i64,
+                  name: &str| {
+        let row = |allele: &str, (terms, [cds, protein, amino_acids, codons], hgvsp): Later| {
+            default_row(
+                "w",
+                location,
+                allele,
+                feature,
+                terms,
+                ["-", cds, protein, amino_acids, codons],
+                &format!(
+                    "STRAND={strand};HGVSc={feature}.1:c.ins{allele};HGVSp={hgvsp};HGVS_OFFSET={offset}"
+                ),
+            )
+        };
+        let first: Later = (
+            "inframe_insertion",
+            [candidate.1[0], candidate.1[1], "-/X", "-/X"],
+            "-",
+        );
+        let reference = parsed(&[row(alleles[0], first), row(alleles[1], reference)]);
+        let candidate = parsed(&[row(alleles[0], first), row(alleles[1], candidate)]);
+        let records = RecordRows::new(&reference, &[record]);
+        let rows = records.of(&reference[1]).expect("no refusal");
+        later_allele_shared_shift(
+            &reference[1],
+            &candidate[1],
+            name,
+            rows.as_deref(),
+            &sequences,
+        )
+        .expect("no refusal")
+    };
+    let terms = |reference_terms: &str, reference_peptides: &str| {
+        judged(
+            "21:1006-1007",
+            TOY_FORWARD,
+            "1",
+            ["AGC", "AGCAGA"],
+            "21\t1006\tw\tA\tAAGC,AAGCAGA\t.\t.\t.",
+            (
+                reference_terms,
+                ["10-11", "4", reference_peptides, "-/CAGCAGatt"],
+                "-",
+            ),
+            ("inframe_insertion", ["6-7", "2-3", "-/SR", "-/AGCAGA"], "-"),
+            4,
+            "Consequence",
+        )
+    };
+    assert!(terms("protein_altering_variant", "L/QQI"));
+    assert!(!terms("missense_variant", "L/QQI"));
+    assert!(!terms("protein_altering_variant", "L/QQV"));
+    let hgvsp = |location: &str, feature: &str, strand: &str, record: &str, offset: i64| {
+        judged(
+            location,
+            feature,
+            strand,
+            ["GG", "GCT"],
+            record,
+            (
+                "inframe_insertion",
+                ["10-11", "4", "-/X", "-/X"],
+                "ENSP1.1:p.His3delinsGlnAla",
+            ),
+            (
+                "inframe_insertion",
+                ["6-7", "2-3", "-/X", "-/X"],
+                "ENSP1.1:p.Gln2dup",
+            ),
+            offset,
+            "HGVSp",
+        )
+    };
+    assert!(hgvsp(
+        "21:2036-2037",
+        TOY_REVERSE,
+        "-1",
+        "21\t2036\tw\tT\tTGG,TGCT\t.\t.\t.",
+        -4
+    ));
+    assert!(!hgvsp(
+        "21:2036-2037",
+        TOY_REVERSE,
+        "-1",
+        "21\t2036\tw\tT\tTGG,TGCT\t.\t.\t.",
+        -3
+    ));
+    assert!(!hgvsp(
+        "21:1006-1007",
+        TOY_FORWARD,
+        "1",
+        "21\t1006\tw\tA\tAGG,AGCT\t.\t.\t.",
+        4
+    ));
+}
