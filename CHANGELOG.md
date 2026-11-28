@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Plugins
-  - Every output format reads a plugin's field from a map of up to 16 keys by a scan, not a hash: 4 to 5 percent less CPU on whole-genome ClinVar with gnomADc.
+  - Plugin fields of a map of up to 16 keys are read by a scan, not a hash: 4 to 5 percent less CPU on whole-genome ClinVar with gnomADc.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
