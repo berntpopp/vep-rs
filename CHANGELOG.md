@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The `--vcf` writer builds each `CSQ` entry in one buffer and `--json` builds each object once: 5 to 8 percent less CPU time on 50,000 1000 Genomes chr21 sites. (#152)
 - Command line, configuration and errors
   - The refusal of an input whose format cannot be detected, a header-only VCF among them, names `--format`, and `--format vcf` for a VCF with no records. (#160)
-- Consequences, HGVS and identifiers
+- Plugins
   - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0. (#162)
   - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads. (#141)
   - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads. (#154)
@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Short spans of start-column tabix tables are read side by side without Linux readahead: 77 percent less wall time on a whole exome with five plugins, cold cache, 16 threads.
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file. (#156)
   - A `.vpd` store opens by mapping its index and checking each file's length and first and last MiB: 0.10 s cold against 41 s, 0.47 GB against 8.5 GB, on a 7 GB store. (#142)
+- HGVS, SPDI and identifiers
   - An allele's alternate coding sequence is translated once for its protein notation and stop-codon tests: 11 percent less wall time on whole-genome ClinVar with `--hgvs`, 16 threads.
 - Caches, reference FASTA and the cache tools
   - A `.json.gz` cache shard inflates in one libdeflate call: a 46,757-variant exome on gzip shards takes 18 percent less wall time from a warm page cache, 16 threads.
