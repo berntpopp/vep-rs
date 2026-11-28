@@ -25,6 +25,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use indexmap::IndexMap;
+use rayon::prelude::*;
 use tracing::debug;
 
 use crate::params::PluginParams;
@@ -228,7 +229,12 @@ impl BuiltinPlugin for DosageSensitivityPlugin {
     /// A later plugin's value replaces an earlier one under the same key
     /// (OutputFactory.pm:2239-2240), its mark too.
     fn run_batch(&self, variants: &mut [InputVariant]) -> Result<(), PluginError> {
-        for variant in variants.iter_mut().filter(|v| self.annotates_variant(v)) {
+        // A variant's rows read the shared table alone, so the variants run
+        // side by side on the run's pool.
+        variants.par_iter_mut().for_each(|variant| {
+            if !self.annotates_variant(variant) {
+                return;
+            }
             for idx in 0..variant.transcript_consequences.len() {
                 let tc = &variant.transcript_consequences[idx];
                 if !self.annotates_row(tc) {
@@ -248,7 +254,7 @@ impl BuiltinPlugin for DosageSensitivityPlugin {
                         .insert(field.to_string(), cell.unwrap_or_default().to_string());
                 }
             }
-        }
+        });
         Ok(())
     }
 
@@ -476,6 +482,43 @@ mod tests {
     /// format no key (`Tab.pm:128`, `OutputFactory/JSON.pm:327`). The row
     /// carries both fields, the missing one empty and unmarked; a four-cell
     /// line keeps its first three cells, as the three-variable assignment does.
+    #[test]
+    fn a_batch_run_side_by_side_writes_each_variant_as_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = plugin_of_table(
+            dir.path(),
+            "#gene\tpHaplo\tpTriplo\nSOD1\t0.5\nBACH1\nKRTAP20-4\t0.1\t0.2\n",
+        );
+        let symbols = ["SOD1", "BACH1", "KRTAP20-4", "APP"];
+        let mut variants: Vec<InputVariant> = (0..400)
+            .map(|i| {
+                let mut variant = snv(150);
+                variant.transcript_consequences.push(row(
+                    Some(symbols[i % 4]),
+                    "ENSG00000000001",
+                    100,
+                    200,
+                ));
+                variant
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| plugin.run_batch(&mut variants)).unwrap();
+        for (i, variant) in variants.iter().enumerate() {
+            let tc = &variant.transcript_consequences[0];
+            let got: Vec<(String, String)> = tc
+                .plugin_data
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let alone = batch_fields(&plugin, symbols[i % 4]);
+            assert_eq!((got, tc.plugin_empty_strings.clone()), alone, "variant {i}");
+        }
+    }
+
     #[test]
     fn a_line_lacking_a_score_cell_keeps_the_gene_with_the_empty_value() {
         let dir = tempfile::tempdir().unwrap();
