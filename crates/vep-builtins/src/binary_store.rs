@@ -167,9 +167,11 @@ pub struct ChunkedSha256<W> {
     inner: W,
     chunk_bytes: usize,
     chunk: Vec<u8>,
-    /// The digests of the chunks being hashed, in order.
-    hashing: std::collections::VecDeque<Receiver<Digest>>,
+    /// The chunks being hashed, in order, each handed back with its digest.
+    hashing: std::collections::VecDeque<Receiver<(Digest, Vec<u8>)>>,
     hashed: Vec<Digest>,
+    /// A chunk hashed and emptied, for the next to fill.
+    spare: Option<Vec<u8>>,
 }
 
 impl<W: IoWrite> ChunkedSha256<W> {
@@ -184,16 +186,21 @@ impl<W: IoWrite> ChunkedSha256<W> {
             chunk: Vec::with_capacity(chunk_bytes),
             hashing: Default::default(),
             hashed: Vec::new(),
+            spare: None,
         }
     }
 
     /// Hands the full chunk to the pool, waiting for the oldest chunk once
     /// more than [`CHUNKS_HASHING`] are hashing.
     fn hand_over(&mut self) {
-        let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(self.chunk_bytes));
+        let next = self
+            .spare
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(self.chunk_bytes));
+        let chunk = std::mem::replace(&mut self.chunk, next);
         let (digest, received) = mpsc::sync_channel(1);
         rayon::spawn(move || {
-            let _ = digest.send(sha256(&chunk));
+            let _ = digest.send((sha256(&chunk), chunk));
         });
         self.hashing.push_back(received);
         while self.hashing.len() > CHUNKS_HASHING {
@@ -204,7 +211,10 @@ impl<W: IoWrite> ChunkedSha256<W> {
     fn take_oldest(&mut self) {
         if let Some(received) = self.hashing.pop_front() {
             // A hashing job that never answered panicked, which aborts.
-            self.hashed.push(received.recv().unwrap_or_default());
+            let (digest, mut chunk) = received.recv().unwrap_or_default();
+            self.hashed.push(digest);
+            chunk.clear();
+            self.spare = Some(chunk);
         }
     }
 
