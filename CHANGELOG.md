@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads. (#141)
-- `NearestExonJB`, `HGVSIntronOffset`, `Blosum62`, `TSSDistance` and `NMD`, plugins without a batch route of their own, annotate a batch's variants side by side on the run's threads: 39, 30, 16, 9 and 7 percent less wall time on genome-wide ClinVar, 16 threads.
+- Plugins without their own batch route (`NearestExonJB`, `HGVSIntronOffset`, `pLI`, `LoFtool`, `Blosum62`, `TSSDistance`, `NMD`) annotate a batch's variants side by side: 7 to 39 percent less wall time on genome-wide ClinVar.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
