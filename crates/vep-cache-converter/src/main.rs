@@ -30,7 +30,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, Seek};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -703,7 +703,7 @@ fn stream_table(
         std::num::NonZero::new(workers).unwrap_or(std::num::NonZero::<usize>::MIN),
         hashed,
     );
-    let mut lines = vep_builtins::tabix::BoundedLines::new(BufReader::new(&mut reader), path);
+    let mut lines = vep_builtins::tabix::BoundedLines::new(&mut reader, path);
     // One allocation of cells for every line, emptied before its line goes.
     let mut spare_cells: Vec<&'static str> = Vec::new();
 
@@ -928,6 +928,7 @@ impl Spans {
 fn read_tabix_records(path: &Path, cfg: &TabixConfig) -> Result<GroupedRecords> {
     use noodles::bgzf;
     use std::collections::BTreeMap;
+    use std::io::BufReader;
     use std::sync::Arc;
 
     let mut file =
