@@ -652,6 +652,8 @@ struct StoreFiles {
     data: Mmap,
     /// The handle `data` was mapped from.
     data_file: File,
+    /// The handle `index` was mapped from.
+    index_file: File,
 }
 
 impl StoreFiles {
@@ -683,8 +685,9 @@ impl StoreFiles {
                 vpdi_path.display()
             ))
         })?;
+        let index_file = index;
         // SAFETY: file is not modified while mapped.
-        let index = unsafe { Mmap::map(&index) }.map_err(|e| {
+        let index = unsafe { Mmap::map(&index_file) }.map_err(|e| {
             PluginError::Init(format!(
                 "failed to read index file {}: {e}",
                 vpdi_path.display()
@@ -707,6 +710,7 @@ impl StoreFiles {
             index,
             data,
             data_file: file,
+            index_file,
         })
     }
 }
@@ -766,7 +770,27 @@ impl BinaryAnnotator {
     /// [`Self::open`]'s refusals.
     pub fn verify(vpd_path: &Path, table: &Path) -> Result<(), PluginError> {
         let files = StoreFiles::read(vpd_path)?;
-        let index = Self::load_index(&files.index, &vpd_path.with_extension("vpdi"), true)?;
+        let index_path = vpd_path.with_extension("vpdi");
+        let opening = files
+            .index
+            .first_chunk::<8>()
+            .ok_or_else(|| read_err(io::ErrorKind::UnexpectedEof.into()))?;
+        index_magic(&opening[..4])?;
+        let version = u32::from_le_bytes(opening[4..].try_into().unwrap_or_default());
+        index_version(version)?;
+        let v5 = version == UNSAMPLED_INDEX_VERSION;
+        // A version 6 index is held to its trailer by `load_index`, then
+        // read whole for its digest and its order.
+        let unordered = if v5 {
+            None
+        } else {
+            index_body(&files.index, &index_path, INDEX_FORMAT_VERSION, false)?;
+            check_index_whole(&files.index, &files.index_file, &index_path)?
+        };
+        let index = Self::load_index(&files.index, &index_path, v5)?;
+        if let Some(unordered) = unordered {
+            return Err(unordered);
+        }
         index.check_sampled(vpd_path, &files.data, table)?;
         index.check_whole(vpd_path, &files.data_file, table)
     }
@@ -1000,10 +1024,7 @@ impl BinaryAnnotator {
                 cursor.set_position(cursor.position() + (POSITION_ENTRY_BYTES - 8) as u64);
                 // A query finds a chromosome's entries by binary search.
                 if let Some(previous) = previous.filter(|&previous| position <= previous) {
-                    return Err(PluginError::Init(format!(
-                        "index positions of chromosome {name:.32} do not ascend: {position} \
-                         follows {previous}; {RECONVERT}"
-                    )));
+                    return Err(unordered(&name, position, previous));
                 }
                 previous = Some(position);
             }
@@ -2842,12 +2863,7 @@ fn index_body<'a>(
     version: u32,
     whole: bool,
 ) -> Result<&'a [u8], PluginError> {
-    let refusal = |difference: std::fmt::Arguments| {
-        PluginError::Init(format!(
-            "store index differs from its own digest: the index file {} {difference}; {RECONVERT}",
-            index_path.display()
-        ))
-    };
+    let refusal = |difference: std::fmt::Arguments| index_refusal(index_path, difference);
     let Some((body, recorded)) = bytes.split_last_chunk::<INDEX_DIGEST_BYTES>() else {
         return Err(refusal(format_args!(
             "holds {} bytes, fewer than the {INDEX_DIGEST_BYTES} of the digest it ends with",
@@ -2888,15 +2904,140 @@ fn index_body<'a>(
     };
     let found = whole_digest(version, body);
     if found != *recorded {
-        return Err(refusal(format_args!(
-            "has SHA256 {} before its last {} bytes, which record {}",
-            hex(&found),
+        return Err(digest_refusal(
+            index_path,
+            &found,
             bytes.len() - body.len(),
-            hex(recorded)
-        )));
+            recorded,
+        ));
     }
     Ok(body)
 }
+
+/// The refusal of the index at `index_path` for `difference` from its own
+/// trailer.
+fn index_refusal(index_path: &Path, difference: std::fmt::Arguments) -> PluginError {
+    PluginError::Init(format!(
+        "store index differs from its own digest: the index file {} {difference}; {RECONVERT}",
+        index_path.display()
+    ))
+}
+
+/// The refusal of an index whose bytes before its last `trailer` bytes have
+/// the digest `found` where those bytes record `recorded`.
+fn digest_refusal(
+    index_path: &Path,
+    found: &Digest,
+    trailer: usize,
+    recorded: &Digest,
+) -> PluginError {
+    index_refusal(
+        index_path,
+        format_args!(
+            "has SHA256 {} before its last {trailer} bytes, which record {}",
+            hex(found),
+            hex(recorded)
+        ),
+    )
+}
+
+/// The refusal of an index whose positions of chromosome `name` hold
+/// `position` after `previous`.
+fn unordered(name: &str, position: u64, previous: u64) -> PluginError {
+    PluginError::Init(format!(
+        "index positions of chromosome {name:.32} do not ascend: {position} follows \
+         {previous}; {RECONVERT}"
+    ))
+}
+
+/// `verify`'s whole check of a version 6 index, `mapped` the bytes an open
+/// checked by their trailer, read once in order through `file`, the handle
+/// they were mapped from, so its pages stay out of the process's mapping:
+/// the bytes before the trailer are refused unless they have the chunked
+/// SHA256 it records, and otherwise the first position found below or at
+/// the one before it in its chromosome is returned, as the refusal
+/// `load_index` words for it. A table the walk cannot read is left to
+/// `load_index`, which refuses it.
+fn check_index_whole(
+    mapped: &[u8],
+    file: &File,
+    index_path: &Path,
+) -> Result<Option<PluginError>, PluginError> {
+    let body_length = mapped.len().saturating_sub(INDEX_TRAILER_BYTES);
+    let recorded: Digest = mapped[body_length..]
+        .first_chunk::<INDEX_DIGEST_BYTES>()
+        .copied()
+        .unwrap_or_default();
+    (&*file).seek(io::SeekFrom::Start(0)).map_err(read_err)?;
+    let mut read = Hashed {
+        inner: BufReader::with_capacity(READ_BYTES, file).take(body_length as u64),
+        hashed: ChunkedSha256::new(io::sink()),
+    };
+    let first_unordered = unordered_entry(&mut read).unwrap_or(None);
+    io::copy(&mut read, &mut io::sink()).map_err(read_err)?;
+    let found = read.hashed.finish().1;
+    if found != recorded {
+        return Err(digest_refusal(
+            index_path,
+            &found,
+            INDEX_TRAILER_BYTES,
+            &recorded,
+        ));
+    }
+    Ok(first_unordered.map(|(name, position, previous)| unordered(&name, position, previous)))
+}
+
+/// The first position of a version 6 index's chromosome table read from
+/// `read` that lies at or below the one before it, with its chromosome and
+/// that one.
+fn unordered_entry(read: &mut impl IoRead) -> io::Result<Option<(String, u64, u64)>> {
+    let mut head = [0u8; 4 + 4 + Layout::BYTES + 2 * (32 + 8 + 32) + 4];
+    read.read_exact(&mut head)?;
+    let chromosomes = u32::from_le_bytes(head[head.len() - 4..].try_into().unwrap_or_default());
+    let mut entries = vec![0u8; ENTRIES_READ * POSITION_ENTRY_BYTES];
+    for _ in 0..chromosomes {
+        let mut length = [0u8; 2];
+        read.read_exact(&mut length)?;
+        let mut name = vec![0u8; usize::from(u16::from_le_bytes(length))];
+        read.read_exact(&mut name)?;
+        let mut counts = [0u8; 16];
+        read.read_exact(&mut counts)?;
+        let mut left = u64::from_le_bytes(counts[8..].try_into().unwrap_or_default());
+        let mut previous: Option<u64> = None;
+        while left > 0 {
+            let taken = left.min(ENTRIES_READ as u64);
+            let batch = &mut entries[..taken as usize * POSITION_ENTRY_BYTES];
+            read.read_exact(batch)?;
+            for entry in batch.chunks_exact(POSITION_ENTRY_BYTES) {
+                let position = u64::from_le_bytes(entry[..8].try_into().unwrap_or_default());
+                if let Some(previous) = previous.filter(|&previous| position <= previous) {
+                    let name = String::from_utf8_lossy(&name).into_owned();
+                    return Ok(Some((name, position, previous)));
+                }
+                previous = Some(position);
+            }
+            left -= taken;
+        }
+    }
+    Ok(None)
+}
+
+/// A reader taking the chunked SHA256 of every byte it reads.
+struct Hashed<R> {
+    inner: R,
+    hashed: ChunkedSha256<io::Sink>,
+}
+
+impl<R: IoRead> IoRead for Hashed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hashed.write_all(&buf[..read])?;
+        Ok(read)
+    }
+}
+
+/// The position entries one read of [`check_index_whole`] takes.
+const ENTRIES_READ: usize = READ_BYTES / POSITION_ENTRY_BYTES;
 
 /// `count` of `unit`s as the `u16` a store's length or count field records, or
 /// the refusal naming `what` with the count.
@@ -4715,7 +4856,52 @@ mod tests {
                      ascend: {follows}; {RECONVERT}"
                 ))
             );
+            // An index whose digest is wrong as well is refused by its digest,
+            // which `verify` holds it to before its order.
+            let mut index = std::fs::read(&vpdi_path).unwrap();
+            let digest_at = index.len() - DIGEST_BYTES;
+            index[digest_at] ^= 1;
+            std::fs::write(&vpdi_path, &index).unwrap();
+            let refused = BinaryAnnotator::verify(&vpd_path, &config.file_path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refused.starts_with(
+                    "plugin initialization failed: store index differs from its own digest"
+                ),
+                "{positions:?}: {refused}"
+            );
         }
+    }
+
+    /// `verify`'s order walk reads a chromosome's entries in batches and
+    /// finds a position out of order past the first batch, in a later
+    /// chromosome, naming it and the position before it; an ordered table has
+    /// none.
+    #[test]
+    fn the_order_walk_finds_a_position_out_of_order_past_its_first_batch() {
+        let table = |unordered_at: Option<u64>| {
+            let mut bytes = vec![0u8; 4 + 4 + Layout::BYTES + 2 * (32 + 8 + 32)];
+            bytes.extend(2u32.to_le_bytes());
+            for (name, count) in [("1", 3u64), ("22", ENTRIES_READ as u64 + 2)] {
+                bytes.extend((name.len() as u16).to_le_bytes());
+                bytes.extend(name.as_bytes());
+                bytes.extend(0u64.to_le_bytes());
+                bytes.extend(count.to_le_bytes());
+                for i in 0..count {
+                    let position = match unordered_at {
+                        Some(at) if name == "22" && i == at => 5,
+                        _ => 10 + i,
+                    };
+                    bytes.extend(position.to_le_bytes());
+                    bytes.extend([0u8; 12]);
+                }
+            }
+            unordered_entry(&mut &bytes[..]).unwrap()
+        };
+        assert_eq!(table(None), None);
+        let at = ENTRIES_READ as u64 + 1;
+        assert_eq!(table(Some(at)), Some(("22".to_string(), 5, 10 + at - 1)));
     }
 
     /// Both scratch files are created before the earlier store's index is
