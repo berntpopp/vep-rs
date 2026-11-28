@@ -1076,6 +1076,9 @@ impl TabixAnnotator {
         if end_block > file_len || start_block > end_block {
             return Err(not_a_block(end_block));
         }
+        if end_block - start_block < slice_bytes as u64 {
+            read_without_readahead(&file);
+        }
         // The span's bytes, its end block and the block past it, at most 64 KiB
         // each, are all the read needs.
         let reach = usize::try_from(end_block - start_block).unwrap_or(usize::MAX);
@@ -1713,6 +1716,21 @@ fn merge_chunks(chunks: &[Chunk]) -> Vec<(bgzf::VirtualPosition, bgzf::VirtualPo
         }
     }
     merged
+}
+
+/// Asks the kernel not to read ahead of `file`'s reads, which a short span
+/// makes alone: the readahead of thousands of scattered spans, on a network
+/// file system above all, fetches far more than the spans hold.
+fn read_without_readahead(file: &std::fs::File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // The advice is a hint the read does not depend on, so a refusal is
+        // ignored. SAFETY: `file` keeps the descriptor open for the call.
+        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
 }
 
 /// Whole bgzf blocks read one after another from a compressed offset of a
@@ -5504,6 +5522,19 @@ mod tests {
             lines(&ann.query_windows_parallel("21", &windows).unwrap()),
             by_sweep
         );
+    }
+
+    /// The advice against readahead leaves what a read of the file returns as
+    /// it was.
+    #[test]
+    fn a_file_read_without_readahead_reads_its_bytes() {
+        use std::io::Read;
+        let path = fixture("blocks.tsv.gz");
+        let mut file = std::fs::File::open(&path).unwrap();
+        read_without_readahead(&file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
     }
 
     /// The block past a span's end block holds no whole bgzf header: the file
