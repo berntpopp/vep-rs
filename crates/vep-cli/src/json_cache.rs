@@ -1752,12 +1752,14 @@ pub(crate) fn merge_shards(
     // RefSeq otherfeatures', so the key carries the source: a RefSeq model whose
     // dbID an Ensembl model shares elsewhere on the chromosome is a different
     // transcript, not a copy.
-    let mut out: Vec<Transcript> = Vec::new();
+    // Sized for every copy up front: growing a vector of transcripts moves them all.
+    let copies: usize = parsed.iter().flatten().map(|s| s.transcripts.len()).sum();
+    let mut out: Vec<Transcript> = Vec::with_capacity(copies);
     let mut gencode = GencodeTally::default();
     // Each kept transcript's place in `out`, and beside `out` the span of
     // every shard the transcript was read from.
-    let mut seen: HashMap<TranscriptKey, usize> = HashMap::new();
-    let mut read_from: Vec<Vec<Option<(u64, u64)>>> = Vec::new();
+    let mut seen: HashMap<TranscriptKey, usize> = HashMap::with_capacity(copies);
+    let mut read_from: Vec<Vec<Option<(u64, u64)>>> = Vec::with_capacity(copies);
     for (item, shard) in parsed.into_iter().zip(shards) {
         let ParsedShard {
             transcripts, tally, ..
