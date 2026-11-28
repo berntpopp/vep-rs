@@ -71,6 +71,8 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use vep_core::assembly::Assembly;
 use vep_core::consequence::{Consequence, TranscriptConsequence};
 use vep_core::sv_routing::perl_true;
@@ -78,6 +80,7 @@ use vep_core::variant::InputVariant;
 
 use crate::annotation_store::{check_table_or_store, open_best_store_with, AnnotationStore};
 use crate::params::PluginParams;
+use crate::pool_pass::map_in_order;
 use crate::tabix::{
     allele_match, last_preamble_line, resolve_indexed_position_column, split_field_count,
     table_contig, BatchQueryResult, TabixAnnotator, TabixConfig, TabixRecord,
@@ -487,15 +490,20 @@ impl BuiltinPlugin for RevelPlugin {
         if batch.is_empty() {
             return Ok(());
         }
-        let mut failure = None;
-        for variant in variants.iter_mut().filter(|v| !v.is_structural) {
+        // A variant's rows read the batch's records alone, so the variants run
+        // side by side; the first failure is the first in variant order.
+        map_in_order(variants.par_iter_mut(), |variant| {
+            if variant.is_structural {
+                return Ok(());
+            }
             // The records come first: most variants of a genome-wide input lie
             // outside the file's coding positions and are done at the lookup,
             // before any of their rows is read.
             let records = self.candidate_records(&batch, variant);
             if records.is_empty() {
-                continue;
+                return Ok(());
             }
+            let mut failure = None;
             for tc in &mut variant.transcript_consequences {
                 if !Self::is_missense(tc) {
                     continue;
@@ -521,11 +529,11 @@ impl BuiltinPlugin for RevelPlugin {
                     }
                 }
             }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+            failure.map_or(Ok(()), Err)
+        })
+        .into_iter()
+        .find(Result::is_err)
+        .unwrap_or(Ok(()))
     }
 
     /// Each output line's `run` walks the span's records and dies on its own
@@ -1473,6 +1481,51 @@ mod tests {
         assert_eq!(fields(&variants[0]), [None]);
         assert_eq!(fields(&variants[1]), [Some("0.311")]);
         assert_eq!(fields(&variants[2]), [Some("0.500"), None]);
+    }
+
+    /// A batch annotated side by side reports the failure of its first failing
+    /// variant in input order, as the serial walk does, and writes every other
+    /// row.
+    #[test]
+    fn a_batch_side_by_side_reports_its_first_failure_in_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = grch38_fixture(
+            dir.path(),
+            "revel.tsv.gz",
+            &[
+                REVEL_HEADER,
+                "21\t100200\t500600\tA",
+                "21\t100200\t500600\tA\tG\tQ\tH\t0.742\tENST00000400001",
+                "21\t100300\t500700\tA\tG\tQ\tH\t0.311\tENST00000400002",
+                "21\t100400\t500800\tA",
+                "21\t100400\t500800\tA\tG\tQ\tH\t0.600\tENST00000400004",
+            ],
+        );
+        let plugin = loaded(Assembly::Grch38, &[&format!("file={path}")]);
+        let at = |pos: u64, transcript: &str| {
+            let mut v = variant("21", pos, b"A", b"G");
+            v.transcript_consequences
+                .push(missense_row(transcript, "Q/H"));
+            v
+        };
+        let mut variants: Vec<InputVariant> =
+            (0..300).map(|_| at(500700, "ENST00000400002")).collect();
+        variants[150] = at(500800, "ENST00000400004");
+        variants[299] = at(500600, "ENST00000400001");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let message = pool.install(|| failed_batch(&plugin, &mut variants));
+        assert!(message.contains("21:500800"), "{message}");
+        for (i, v) in variants.iter().enumerate() {
+            let want = if i == 150 || i == 299 {
+                None
+            } else {
+                Some("0.311")
+            };
+            assert_eq!(fields(v), [want], "variant {i}");
+        }
     }
 
     /// `REVEL.pm:193` and `:197` return at the first full match, so a record
