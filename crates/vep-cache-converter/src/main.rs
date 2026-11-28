@@ -721,7 +721,10 @@ fn stream_table(
             other => anyhow::anyhow!(other.detail()),
         })?;
         // The text [`vep_builtins::tabix::lossy_text`] makes of the line.
-        let line = String::from_utf8_lossy(line);
+        let line = match std::str::from_utf8(line) {
+            Ok(text) => std::borrow::Cow::Borrowed(text),
+            Err(_) => String::from_utf8_lossy(line),
+        };
         if line.is_empty() {
             continue;
         }
@@ -741,7 +744,7 @@ fn stream_table(
         }
 
         let mut cells = recycled(std::mem::take(&mut spare_cells));
-        cells.extend(line.split('\t'));
+        split_tabs(&line, &mut cells);
         let bare_header = before_first_row
             && !header_read
             && cells
@@ -817,6 +820,20 @@ fn recycled<'b>(mut cells: Vec<&str>) -> Vec<&'b str> {
     cells.into_iter().map(|_| "").collect()
 }
 
+/// Appends the cells of `line` to `cells`, as `line.split('\t')` gives them,
+/// testing each byte: a table's cells are short, and `split` starts a search
+/// for each.
+fn split_tabs<'a>(line: &'a str, cells: &mut Vec<&'a str>) {
+    let mut from = 0;
+    for (at, &byte) in line.as_bytes().iter().enumerate() {
+        if byte == b'\t' {
+            cells.push(&line[from..at]);
+            from = at + 1;
+        }
+    }
+    cells.push(&line[from..]);
+}
+
 /// The rows a conversion read that the verification takes its probes from:
 /// what the table holds, whatever the store was given. The table's starts
 /// are numbered in the order they are read, a start read again after
@@ -869,7 +886,8 @@ impl Spans {
             if !self.every_start && (self.starts - 1) / self.stride >= KEPT_STARTS {
                 self.stride *= 2;
                 let stride = self.stride;
-                self.kept.retain(|&(numbered, ..)| numbered.is_multiple_of(stride));
+                self.kept
+                    .retain(|&(numbered, ..)| numbered.is_multiple_of(stride));
             }
         }
         let numbered = self.starts - 1;
@@ -3005,6 +3023,23 @@ mod tests {
         .into_iter()
         .map(|(_, position)| position)
         .collect()
+    }
+
+    /// A line splits at its tabs as `str::split` splits it.
+    #[test]
+    fn a_line_splits_at_its_tabs_as_split_splits_it() {
+        for line in [
+            "",
+            "\t",
+            "a",
+            "21\t100\tA\tC",
+            "\tlead\t\ttrail\t",
+            "é\tü\t\u{1F600}x",
+        ] {
+            let mut cells = Vec::new();
+            split_tabs(line, &mut cells);
+            assert_eq!(cells, line.split('\t').collect::<Vec<_>>(), "{line:?}");
+        }
     }
 
     /// Each record of a checked start is probed at its start, its end, its
