@@ -430,17 +430,12 @@ pub trait BuiltinPlugin: sealed::Sealed + Send + Sync {
     /// row's variant, unless it names a record itself, so a run that holds a
     /// batch's warnings reports it with that record
     /// (`vep_core::warning_hold`).
+    ///
+    /// The variants are run side by side on the current rayon pool
+    /// ([`run_batch_in_parallel`]), which returns the serial loop's fields,
+    /// warnings and first failure: a plugin's `run` reads shared data alone.
     fn run_batch(&self, variants: &mut [InputVariant]) -> Result<(), PluginError> {
-        let mut first_failure = None;
-        for variant in variants.iter_mut() {
-            if let Err(error) = run_rows(self, variant) {
-                first_failure.get_or_insert(error);
-            }
-        }
-        match first_failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        run_batch_in_parallel(self, variants)
     }
 
     /// Annotate a single transcript consequence (per-transcript plugins).
@@ -708,7 +703,7 @@ mod tests {
         ) -> Result<IndexMap<String, String>, PluginError> {
             std::thread::sleep(std::time::Duration::from_micros(50 * (40 - variant.start)));
             let _ = vep_core::warning_hold::offer(0, format!("row at {}", variant.start));
-            if variant.start % 3 == 0 {
+            if variant.start.is_multiple_of(3) {
                 return Err(PluginError::Run(format!("fails at {}", variant.start)));
             }
             Ok(IndexMap::from([(
@@ -718,9 +713,9 @@ mod tests {
         }
     }
 
-    /// The parallel default writes the fields, hands on the warnings and
-    /// returns the failure the serial default does: the first failure in
-    /// variant order, whatever thread ran which variant.
+    /// The default `run_batch`, run on a pool, writes the fields, hands on the
+    /// warnings and returns the failure a serial walk of `run_rows` does: the
+    /// first failure in variant order, whatever thread ran which variant.
     #[test]
     fn the_parallel_default_run_batch_matches_the_serial_one() {
         use vep_core::warning_hold::holding;
@@ -743,14 +738,22 @@ mod tests {
                 .collect()
         };
         let mut serial = batch();
-        let (serial_result, serial_raised) = holding(|| SlowFailingPlugin.run_batch(&mut serial));
+        let (serial_result, serial_raised) = holding(|| {
+            serial
+                .iter_mut()
+                .map(|variant| run_rows(&SlowFailingPlugin, variant))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .find(Result::is_err)
+                .unwrap_or(Ok(()))
+        });
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(8)
             .build()
             .unwrap();
         let mut parallel = batch();
         let (parallel_result, parallel_raised) =
-            pool.install(|| holding(|| run_batch_in_parallel(&SlowFailingPlugin, &mut parallel)));
+            pool.install(|| holding(|| SlowFailingPlugin.run_batch(&mut parallel)));
         assert_eq!(
             serial_result.unwrap_err().to_string(),
             "plugin execution failed: fails at 3"
