@@ -288,13 +288,13 @@ fn is_perl_whitespace(c: char) -> bool {
     c.is_ascii_whitespace() || c == '\x0B'
 }
 
-/// Appends one CSQ subfield value to `out`, escaped the way Ensembl VEP does
-/// (`OutputFactory/VCF.pm:401-404`): `,` and `|` become `&`, `;` becomes
-/// `%3B`, a run of ASCII whitespace becomes one `_`. A control character that
-/// is not whitespace, which Ensembl VEP writes as it is, becomes its `%XX`
-/// percent-encoding, as the default and tab formats write it
-/// ([`fields::percent_encode_control_bytes`]).
-fn vcf_encode_into(out: &mut String, value: &str) {
+/// Escape one CSQ subfield value the way Ensembl VEP does (`OutputFactory/VCF.pm:401-404`):
+/// `,` and `|` become `&`, `;` becomes `%3B`, a run of ASCII whitespace becomes
+/// one `_`. A control character that is not whitespace, which Ensembl VEP writes as it
+/// is, becomes its `%XX` percent-encoding, as the default and tab formats write
+/// it ([`fields::percent_encode_control_bytes`]).
+fn vcf_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
     let mut in_whitespace = false;
     for ch in value.chars() {
         let whitespace = is_perl_whitespace(ch);
@@ -314,6 +314,16 @@ fn vcf_encode_into(out: &mut String, value: &str) {
         }
         in_whitespace = whitespace;
     }
+    out
+}
+
+pub(crate) fn value_for_field(
+    field: &str,
+    variant: &InputVariant,
+    tc: Option<&TranscriptConsequence>,
+    options: &FieldOptions,
+) -> String {
+    fields::field_value(field, variant, tc, options, "&")
 }
 
 /// One CSQ entry. A gene symbol's whitespace is percent-encoded before the
@@ -330,31 +340,26 @@ fn format_csq_entry(
     tc: Option<&TranscriptConsequence>,
     options: &FieldOptions,
 ) -> String {
-    let mut entry = String::new();
-    let mut bytes = Vec::new();
-    for (i, (field, produced)) in fields.iter().zip(produced).enumerate() {
-        if i > 0 {
-            entry.push('|');
-        }
-        if !produced {
-            continue;
-        }
-        bytes.clear();
-        fields::write_field_value(&mut bytes, field, variant, tc, options, "&");
-        let v = String::from_utf8_lossy(&bytes);
-        if v == "-" && field != "Allele" {
-            continue;
-        }
-        if field == "Allele" && variant.strand.as_i8() < 0 {
-            let reversed = reverse_complement(v.as_bytes());
-            vcf_encode_into(&mut entry, &String::from_utf8_lossy(&reversed));
-        } else if field == "SYMBOL" && !options.no_escape {
-            vcf_encode_into(&mut entry, &v.replace(is_perl_whitespace, "%20"));
-        } else {
-            vcf_encode_into(&mut entry, &v);
-        }
-    }
-    entry
+    fields
+        .iter()
+        .zip(produced)
+        .map(|(field, produced)| {
+            if !produced {
+                return String::new();
+            }
+            let v = value_for_field(field, variant, tc, options);
+            if v == "-" && field != "Allele" {
+                String::new()
+            } else if field == "Allele" && variant.strand.as_i8() < 0 {
+                vcf_encode(&String::from_utf8_lossy(&reverse_complement(v.as_bytes())))
+            } else if field == "SYMBOL" && !options.no_escape {
+                vcf_encode(&v.replace(is_perl_whitespace, "%20"))
+            } else {
+                vcf_encode(&v)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Whether `allele` is one or more of the bases `A`, `C`, `G`, `T`, `N`
@@ -675,12 +680,6 @@ mod tests {
     use smallvec::smallvec;
     use vep_core::consequence::{Consequence, FeatureType, Impact, TranscriptConsequence};
     use vep_core::transcript::Transcript;
-
-    fn vcf_encode(value: &str) -> String {
-        let mut out = String::new();
-        vcf_encode_into(&mut out, value);
-        out
-    }
 
     #[test]
     fn test_csq_header_generation() {
