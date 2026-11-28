@@ -306,8 +306,6 @@ impl BuiltinPlugin for GnomadcPlugin {
                 self.write_means(&records, variant);
             }
         });
-        // The batch's records are freed by one pool job, off the batch's path.
-        rayon::spawn(move || drop(batch_result));
 
         Ok(())
     }
