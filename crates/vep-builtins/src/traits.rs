@@ -430,17 +430,12 @@ pub trait BuiltinPlugin: sealed::Sealed + Send + Sync {
     /// row's variant, unless it names a record itself, so a run that holds a
     /// batch's warnings reports it with that record
     /// (`vep_core::warning_hold`).
+    ///
+    /// The variants are run side by side on the current rayon pool
+    /// ([`run_batch_in_parallel`]), which returns the serial loop's fields,
+    /// warnings and first failure: a plugin's `run` reads shared data alone.
     fn run_batch(&self, variants: &mut [InputVariant]) -> Result<(), PluginError> {
-        let mut first_failure = None;
-        for variant in variants.iter_mut() {
-            if let Err(error) = run_rows(self, variant) {
-                first_failure.get_or_insert(error);
-            }
-        }
-        match first_failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        run_batch_in_parallel(self, variants)
     }
 
     /// Annotate a single transcript consequence (per-transcript plugins).
