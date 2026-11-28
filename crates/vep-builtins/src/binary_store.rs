@@ -33,7 +33,8 @@
 //! **Data file (`.vpd`)**: large, memory-mapped:
 //! - Header: magic `VPDA`, version `u32`, column count `u16`
 //! - Column name table: the header row, stored once
-//! - Records: contiguous, sorted by (chr, position), each record is:
+//! - Records: a chromosome's contiguous and sorted by position, the
+//!   chromosomes in the order the index gives them, each record is:
 //!   - `position: u64`, `end_position: u64`, `field_count: u16`
 //!   - For each field: `value_len: u16` + `value: [u8; value_len]`
 //!
@@ -83,8 +84,9 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read as IoRead, Seek, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -1488,7 +1490,6 @@ impl BinaryStoreWriter {
         source: &ContentIdentity,
     ) -> Result<(u64, u64, u64), PluginError> {
         let mut stream = self.stream(column_names, config)?;
-        stream.chromosomes_as_given = true;
         let mut given: HashSet<&str> = HashSet::with_capacity(records.len());
         for (chr_name, chr_records) in records {
             if !given.insert(chr_name.as_str()) {
@@ -1537,7 +1538,8 @@ impl BinaryStoreWriter {
         let layout = Layout::of(config)?;
         let published = self.published_paths()?;
         let scratch = Scratch::create(&published)?;
-        let stream = BinaryStoreStream {
+        let data = scratch.data.try_clone().map_err(write_err)?;
+        let mut stream = BinaryStoreStream {
             published,
             scratch,
             layout,
@@ -1547,11 +1549,14 @@ impl BinaryStoreWriter {
             open: None,
             rows: 0,
             span_files: 0,
-            chromosomes_as_given: false,
+            direct: None,
+            direct_bytes: 0,
+            row: Vec::new(),
             failed: false,
             previous_index_removed: false,
             published_whole: false,
         };
+        stream.direct = Some(Mutex::new(OffThreadWriter::new(data)));
         stream.write_header()?;
         Ok(stream)
     }
@@ -1626,26 +1631,164 @@ const ENTRY_BYTES: usize = 8 + 8 + 4;
 /// its cells.
 const ROW_HEAD_BYTES: usize = 8 + 8 + 2;
 
+/// The bytes [`OffThreadWriter`] hands its threads at a time.
+const HANDED_BYTES: usize = 1 << 20;
+
+/// The position entries one read of an entries scratch file takes, a chunk
+/// of [`OffThreadWriter`]'s.
+const ENTRIES_CHUNK: usize = HANDED_BYTES / ENTRY_BYTES;
+
+/// The chunks of `HANDED_BYTES` an [`OffThreadWriter`] holds, allocated
+/// once: the one being filled and those its threads hash and write.
+const HANDED_CHUNKS: usize = 4;
+
+/// The writer a stream's mutex holds, which no thread locks.
+fn unlocked(direct: &mut Mutex<OffThreadWriter>) -> &mut OffThreadWriter {
+    direct
+        .get_mut()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`unlocked`], the mutex taken apart.
+fn into_unlocked(direct: Mutex<OffThreadWriter>) -> OffThreadWriter {
+    direct
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A file written whole, its bytes hashed by one thread and written by
+/// another, so the caller neither hashes nor waits on the file but for a
+/// full queue; the hashing thread hands each full chunk of a
+/// [`ChunkedSha256`] to the rayon pool. [`Self::finish`] returns the file and
+/// the chunked SHA256 of every byte taken; a failed write is returned by the
+/// next write or by [`Self::finish`].
+struct OffThreadWriter {
+    chunk: Vec<u8>,
+    to_hash: Option<SyncSender<Vec<u8>>>,
+    spare: Receiver<Vec<u8>>,
+    hasher: Option<JoinHandle<Digest>>,
+    writer: Option<JoinHandle<io::Result<File>>>,
+}
+
+impl OffThreadWriter {
+    fn new(mut file: File) -> Self {
+        let (to_hash, hash_rx) = mpsc::sync_channel::<Vec<u8>>(HANDED_CHUNKS);
+        let (to_write, write_rx) = mpsc::sync_channel::<Vec<u8>>(HANDED_CHUNKS);
+        let (to_spare, spare) = mpsc::sync_channel(HANDED_CHUNKS);
+        for _ in 1..HANDED_CHUNKS {
+            let _ = to_spare.send(Vec::with_capacity(HANDED_BYTES));
+        }
+        let hasher = thread::spawn(move || {
+            let mut hashed = ChunkedSha256::new(io::sink());
+            for chunk in hash_rx {
+                let _ = hashed.write_all(&chunk);
+                if to_write.send(chunk).is_err() {
+                    break;
+                }
+            }
+            hashed.finish().1
+        });
+        let writer = thread::spawn(move || {
+            for chunk in write_rx {
+                file.write_all(&chunk)?;
+                let _ = to_spare.send(chunk);
+            }
+            Ok(file)
+        });
+        Self {
+            chunk: Vec::with_capacity(HANDED_BYTES),
+            to_hash: Some(to_hash),
+            spare,
+            hasher: Some(hasher),
+            writer: Some(writer),
+        }
+    }
+
+    /// Hands the bytes taken to the threads; a closed queue means the
+    /// writer failed, and its error is returned.
+    fn hand_over(&mut self) -> io::Result<()> {
+        if let Ok(next) = self.spare.recv() {
+            let chunk = std::mem::replace(&mut self.chunk, next);
+            let sent = self.to_hash.as_ref().map(|to_hash| to_hash.send(chunk));
+            if matches!(sent, Some(Ok(()))) {
+                self.chunk.clear();
+                return Ok(());
+            }
+        }
+        self.join().map(|_| ())?;
+        Err(io::Error::other("the data file's writer stopped"))
+    }
+
+    /// Waits for both threads: the digest and the file, or the write's error.
+    fn join(&mut self) -> io::Result<(File, Digest)> {
+        self.to_hash = None;
+        let stopped = || io::Error::other("the data file's writer stopped");
+        let digest = self.hasher.take().ok_or_else(stopped)?.join();
+        let file = self.writer.take().ok_or_else(stopped)?.join();
+        match (file, digest) {
+            (Ok(file), Ok(digest)) => Ok((file?, digest)),
+            _ => Err(stopped()),
+        }
+    }
+
+    /// The file, every byte taken written to it, and their SHA256.
+    fn finish(mut self) -> io::Result<(File, Digest)> {
+        if !self.chunk.is_empty() {
+            self.hand_over()?;
+        }
+        self.join()
+    }
+}
+
+impl IoWrite for OffThreadWriter {
+    /// A chunk is handed over before it outgrows its allocation.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.chunk.len() + bytes.len() > HANDED_BYTES && !self.chunk.is_empty() {
+            self.hand_over()?;
+        }
+        self.chunk.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// The bytes reach the file by [`Self::finish`].
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for OffThreadWriter {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
 /// A store being written one row at a time ([`BinaryStoreWriter::stream`]).
 ///
-/// The rows may come in any order. Each is encoded as the store's record and
-/// appended to a scratch file of its chromosome as it is given, and
-/// [`Self::finish`] writes the data file as its header followed by the
-/// chromosomes' rows in the byte order of the chromosomes' names, a
-/// chromosome's rows sorted by start and the rows of one start in the order
-/// they were given, then the index, and renames both into place. A chromosome
+/// The rows may come in any order. While each chromosome comes in one run of
+/// rows in start order, as every table `tabix` indexes has them, a row is
+/// encoded as the store's record and appended to the data file as it is
+/// given, hashed and written off the caller's thread, and the chromosomes are
+/// stored in the order given, as [`BinaryStoreWriter::write`] stores them. A
+/// chromosome given again after another, or a row below the start before it,
+/// moves every chromosome's rows to a scratch file of its own, and from then
+/// on rows are appended there: [`Self::finish`] writes the data file as its
+/// header followed by the chromosomes' rows in the byte order of the
+/// chromosomes' names, a chromosome's rows sorted by start and the rows of
+/// one start in the order they were given, and hashes it whole. A chromosome
 /// given in two separate runs of rows is one chromosome of the store.
+/// [`Self::finish`] then writes the index and renames both into place.
 ///
 /// What the stream holds in memory does not grow with the rows of a table
-/// whose chromosomes each come sorted by start, as every table `tabix` indexes
-/// has them. Of a row nothing is kept once its call returns. Of a chromosome
-/// the stream keeps its name and a fixed record of counts. The chromosome
-/// being given has one buffer of `ROWS_BUFFER` bytes. A chromosome's
-/// position entries, 20 bytes a distinct start, lie in a scratch file of their
-/// own until the index is written. A chromosome whose rows came out of start
-/// order is put in order at [`Self::finish`] by a stable sort of its rows'
-/// starts and offsets alone, 16 bytes a row of that chromosome, held while
-/// that chromosome is written.
+/// whose chromosomes each come sorted by start. Of a row nothing is kept once
+/// its call returns. Of a chromosome the stream keeps its name and a fixed
+/// record of counts. The data file's bytes pass through a few chunks of
+/// `HANDED_BYTES`, and a chromosome being given to its scratch file has one
+/// buffer of `ROWS_BUFFER` bytes. A chromosome's position entries, 20 bytes a
+/// distinct start, lie in a scratch file of their own until the index is
+/// written. A chromosome whose rows came out of start order is put in order
+/// at [`Self::finish`] by a stable sort of its rows' starts and offsets
+/// alone, 16 bytes a row of that chromosome, held while that chromosome is
+/// written.
 ///
 /// The scratch files lie beside the data file under the names `numbered_path`
 /// gives them, one of rows and one of position entries a chromosome, and only
@@ -1673,9 +1816,15 @@ pub struct BinaryStoreStream {
     rows: u64,
     /// The span scratch paths handed out ([`Self::span_scratch_path`]).
     span_files: usize,
-    /// Whether the chromosomes are stored in the order they were given, as
-    /// [`BinaryStoreWriter::write`] stores them, and not by name.
-    chromosomes_as_given: bool,
+    /// The data file, hashed as it is written, while every chromosome has
+    /// come in one run in start order and its rows go straight into it.
+    /// The mutex is never locked: it keeps the stream `Sync` and unwind safe,
+    /// and the writer is reached through `&mut self`.
+    direct: Option<Mutex<OffThreadWriter>>,
+    /// The bytes given to `direct`, the header's among them.
+    direct_bytes: u64,
+    /// The bytes of one row, encoded before it is written.
+    row: Vec<u8>,
     /// Whether a call failed, after which no row is taken and nothing is
     /// published.
     failed: bool,
@@ -1713,7 +1862,8 @@ struct StreamedChromosome {
 struct OpenChromosome {
     /// The chromosome's place in the stream's list.
     number: usize,
-    rows: BufWriter<File>,
+    /// Its rows scratch file; none while its rows go into the data file.
+    rows: Option<BufWriter<File>>,
     /// The position entries, while the chromosome's rows come in order.
     starts: Option<BufWriter<File>>,
 }
@@ -1721,7 +1871,7 @@ struct OpenChromosome {
 impl BinaryStoreStream {
     /// Writes the data file's header: the magic, the version and the column
     /// names.
-    fn write_header(&self) -> Result<(), PluginError> {
+    fn write_header(&mut self) -> Result<(), PluginError> {
         let mut header = Vec::new();
         header.extend_from_slice(VPD_MAGIC);
         header.extend_from_slice(&DATA_FORMAT_VERSION.to_le_bytes());
@@ -1734,7 +1884,12 @@ impl BinaryStoreStream {
             header.extend_from_slice(&name_len.to_le_bytes());
             header.extend_from_slice(name.as_bytes());
         }
-        (&self.scratch.data).write_all(&header).map_err(write_err)
+        self.direct_bytes = header.len() as u64;
+        match self.direct.as_mut().map(unlocked) {
+            Some(direct) => direct.write_all(&header),
+            None => (&self.scratch.data).write_all(&header),
+        }
+        .map_err(write_err)
     }
 
     /// The chromosomes given so far.
@@ -1791,12 +1946,19 @@ impl BinaryStoreStream {
         cells: &[S],
     ) -> Result<(), PluginError> {
         self.chromosome(chr)?;
+        let leaves_order = self.open.as_ref().is_some_and(|open| {
+            let chromosome = &self.chromosomes[open.number];
+            chromosome.in_order && chromosome.rows > 0 && start < chromosome.last_start
+        });
+        if leaves_order && self.direct.is_some() {
+            self.leave_direct()?;
+        }
         let Some(open) = self.open.as_mut() else {
             return Err(write_err(io::Error::other("no chromosome is open")));
         };
         let chromosome = &mut self.chromosomes[open.number];
 
-        if chromosome.in_order && chromosome.rows > 0 && start < chromosome.last_start {
+        if leaves_order {
             // The entries written so far follow the order the rows came in,
             // which is not the store's from this row on.
             chromosome.in_order = false;
@@ -1827,12 +1989,11 @@ impl BinaryStoreStream {
 
         let row = || format!("row {chr:.32}:{start}");
         let field_count = recorded(cells.len(), "cells", row)?;
-        let rows = &mut open.rows;
-        rows.write_all(&start.to_le_bytes()).map_err(write_err)?;
-        rows.write_all(&end.to_le_bytes()).map_err(write_err)?;
-        rows.write_all(&field_count.to_le_bytes())
-            .map_err(write_err)?;
-        let mut row_bytes = ROW_HEAD_BYTES as u64;
+        let encoded = &mut self.row;
+        encoded.clear();
+        encoded.extend_from_slice(&start.to_le_bytes());
+        encoded.extend_from_slice(&end.to_le_bytes());
+        encoded.extend_from_slice(&field_count.to_le_bytes());
         for (col_index, cell) in cells.iter().enumerate() {
             let cell = cell.as_ref().as_bytes();
             let value_len = recorded(cell.len(), "bytes", || {
@@ -1842,10 +2003,18 @@ impl BinaryStoreStream {
                     .map_or(String::new(), |name| format!(" ({name})"));
                 format!("{} cell {col_index}{name}", row())
             })?;
-            rows.write_all(&value_len.to_le_bytes())
-                .map_err(write_err)?;
-            rows.write_all(cell).map_err(write_err)?;
-            row_bytes += 2 + cell.len() as u64;
+            encoded.extend_from_slice(&value_len.to_le_bytes());
+            encoded.extend_from_slice(cell);
+        }
+        match (&mut open.rows, self.direct.as_mut().map(unlocked)) {
+            (Some(rows), _) => rows.write_all(encoded),
+            (None, Some(direct)) => direct.write_all(encoded),
+            (None, None) => Err(io::Error::other("no rows file is open")),
+        }
+        .map_err(write_err)?;
+        let row_bytes = encoded.len() as u64;
+        if self.direct.is_some() {
+            self.direct_bytes += row_bytes;
         }
 
         chromosome.rows += 1;
@@ -1867,6 +2036,9 @@ impl BinaryStoreStream {
         }
         self.close_open()?;
         let known = self.numbers.get(name).copied();
+        if known.is_some() && self.direct.is_some() {
+            self.leave_direct()?;
+        }
         let number = known.unwrap_or(self.chromosomes.len());
         let fresh = known.is_none();
         if fresh {
@@ -1880,21 +2052,24 @@ impl BinaryStoreStream {
                 entries: 0,
                 group_offset: 0,
                 group_rows: 0,
-                data_offset: 0,
+                data_offset: self.direct_bytes,
             });
             self.numbers.insert(name.to_string(), number);
         }
         let data = &self.published.data;
-        let rows = open_numbered(&numbered_path(data, ROWS_ROLE, number), fresh)?;
+        let rows = match self.direct {
+            Some(_) => None,
+            None => Some(self.rows_file(number, fresh)?),
+        };
         let starts = if self.chromosomes[number].in_order {
             let starts = open_numbered(&numbered_path(data, STARTS_ROLE, number), fresh)?;
-            Some(BufWriter::new(starts))
+            Some(BufWriter::with_capacity(ROWS_BUFFER, starts))
         } else {
             None
         };
         self.open = Some(OpenChromosome {
             number,
-            rows: BufWriter::with_capacity(ROWS_BUFFER, rows),
+            rows,
             starts,
         });
         Ok(())
@@ -1905,9 +2080,56 @@ impl BinaryStoreStream {
         let Some(mut open) = self.open.take() else {
             return Ok(());
         };
-        open.rows.flush().map_err(write_err)?;
+        if let Some(rows) = &mut open.rows {
+            rows.flush().map_err(write_err)?;
+        }
         if let Some(starts) = &mut open.starts {
             starts.flush().map_err(write_err)?;
+        }
+        Ok(())
+    }
+
+    /// The rows scratch file of chromosome `number`, opened for writing at
+    /// its end (`open_numbered`).
+    fn rows_file(&self, number: usize, fresh: bool) -> Result<BufWriter<File>, PluginError> {
+        let path = numbered_path(&self.published.data, ROWS_ROLE, number);
+        Ok(BufWriter::with_capacity(
+            ROWS_BUFFER,
+            open_numbered(&path, fresh)?,
+        ))
+    }
+
+    /// Stops writing rows straight into the data file, for a chromosome
+    /// given again or out of start order: each chromosome's rows move from
+    /// the data file to its rows scratch file, the data file keeps its header
+    /// alone, and from here on the stream stores as [`Self::finish`] says.
+    fn leave_direct(&mut self) -> Result<(), PluginError> {
+        let Some(direct) = self.direct.take().map(into_unlocked) else {
+            return Ok(());
+        };
+        let (data, _) = direct.finish().map_err(write_err)?;
+        let mut read = File::open(&self.scratch.paths.data).map_err(write_err)?;
+        for (number, chromosome) in self.chromosomes.iter().enumerate() {
+            read.seek(io::SeekFrom::Start(chromosome.data_offset))
+                .map_err(read_err)?;
+            let mut rows = self.rows_file(number, true)?;
+            let moved =
+                io::copy(&mut (&mut read).take(chromosome.bytes), &mut rows).map_err(write_err)?;
+            rows.flush().map_err(write_err)?;
+            if moved != chromosome.bytes {
+                return Err(cut_short(&self.scratch.paths.data));
+            }
+        }
+        let header = BinaryStoreWriter::header_size(&self.column_names);
+        data.set_len(header).map_err(write_err)?;
+        (&self.scratch.data)
+            .seek(io::SeekFrom::Start(header))
+            .map_err(write_err)?;
+        if let Some(number) = self.open.as_ref().map(|open| open.number) {
+            let rows = self.rows_file(number, false)?;
+            if let Some(open) = &mut self.open {
+                open.rows = Some(rows);
+            }
         }
         Ok(())
     }
@@ -1931,7 +2153,7 @@ impl BinaryStoreStream {
     fn publish(&mut self, source: &ContentIdentity) -> Result<(u64, u64, u64), PluginError> {
         self.close_open()?;
         let mut order: Vec<usize> = (0..self.chromosomes.len()).collect();
-        if !self.chromosomes_as_given {
+        if self.direct.is_none() {
             order.sort_by(|&a, &b| self.chromosomes[a].name.cmp(&self.chromosomes[b].name));
         }
         for chromosome in &self.chromosomes {
@@ -1940,28 +2162,38 @@ impl BinaryStoreStream {
             }
         }
 
-        let mut data_offset = BinaryStoreWriter::header_size(&self.column_names);
-        for &number in &order {
-            self.chromosomes[number].data_offset = data_offset;
-            let rows_path = numbered_path(&self.published.data, ROWS_ROLE, number);
-            if self.chromosomes[number].in_order {
-                self.copy_rows(&rows_path, number)?;
-            } else {
-                self.copy_rows_by_start(&rows_path, number)?;
-            }
-            let _ = std::fs::remove_file(&rows_path);
-            data_offset += self.chromosomes[number].bytes;
-        }
-        let data_size = data_offset;
-        // Read back through the handle that holds the file's lock.
-        let data = ContentIdentity::of_handle(&self.scratch.data).map_err(|e| {
+        let data_path = self.scratch.paths.data.clone();
+        let unread = |e: io::Error| {
             PluginError::Init(format!(
                 "failed to read data file {}: {e}",
-                self.scratch.paths.data.display()
+                data_path.display()
             ))
-        })?;
+        };
+        let (data_size, data) = if let Some(direct) = self.direct.take().map(into_unlocked) {
+            let (file, sha256) = direct.finish().map_err(write_err)?;
+            let length = self.direct_bytes;
+            let sampled = sampled_digest(&file, length).map_err(unread)?;
+            (length, ContentIdentity::new(sha256, length, sampled))
+        } else {
+            let mut data_offset = BinaryStoreWriter::header_size(&self.column_names);
+            for &number in &order {
+                self.chromosomes[number].data_offset = data_offset;
+                let rows_path = numbered_path(&self.published.data, ROWS_ROLE, number);
+                if self.chromosomes[number].in_order {
+                    self.copy_rows(&rows_path, number)?;
+                } else {
+                    self.copy_rows_by_start(&rows_path, number)?;
+                }
+                let _ = std::fs::remove_file(&rows_path);
+                data_offset += self.chromosomes[number].bytes;
+            }
+            // Read back through the handle that holds the file's lock.
+            let data = ContentIdentity::of_handle(&self.scratch.data).map_err(unread)?;
+            (data_offset, data)
+        };
 
-        let mut idx_writer = BufWriter::new(ChunkedSha256::new(&self.scratch.index));
+        let index = self.scratch.index.try_clone().map_err(write_err)?;
+        let mut idx_writer = OffThreadWriter::new(index);
         idx_writer.write_all(VPDI_MAGIC).map_err(write_err)?;
         idx_writer
             .write_all(&INDEX_FORMAT_VERSION.to_le_bytes())
@@ -2003,19 +2235,22 @@ impl BinaryStoreStream {
 
             let starts_path = numbered_path(&self.published.data, STARTS_ROLE, number);
             if chromosome.entries > 0 {
-                let starts = File::open(&starts_path).map_err(|e| scratch_err(&starts_path, e))?;
-                let mut starts = BufReader::new(starts);
-                let mut entry = [0u8; ENTRY_BYTES];
-                for _ in 0..chromosome.entries {
-                    starts.read_exact(&mut entry).map_err(read_err)?;
-                    let (position, rest) = entry.split_at(8);
-                    let (offset, count) = rest.split_at(8);
-                    let offset = u64::from_le_bytes(offset.try_into().unwrap_or_default());
-                    idx_writer.write_all(position).map_err(write_err)?;
-                    idx_writer
-                        .write_all(&(chromosome.data_offset + offset).to_le_bytes())
-                        .map_err(write_err)?;
-                    idx_writer.write_all(count).map_err(write_err)?;
+                let mut starts =
+                    File::open(&starts_path).map_err(|e| scratch_err(&starts_path, e))?;
+                let mut chunk = vec![0u8; ENTRIES_CHUNK * ENTRY_BYTES];
+                let mut left = chromosome.entries;
+                while left > 0 {
+                    let taken = left.min(ENTRIES_CHUNK as u64);
+                    let bytes = &mut chunk[..taken as usize * ENTRY_BYTES];
+                    starts.read_exact(bytes).map_err(read_err)?;
+                    for entry in bytes.chunks_exact_mut(ENTRY_BYTES) {
+                        let offset =
+                            u64::from_le_bytes(entry[8..16].try_into().unwrap_or_default());
+                        entry[8..16]
+                            .copy_from_slice(&(chromosome.data_offset + offset).to_le_bytes());
+                    }
+                    idx_writer.write_all(bytes).map_err(write_err)?;
+                    left -= taken;
                 }
             }
             if open_group {
@@ -2029,12 +2264,9 @@ impl BinaryStoreStream {
             let _ = std::fs::remove_file(&starts_path);
         }
 
-        let hashed = idx_writer
-            .into_inner()
-            .map_err(|e| write_err(e.into_error()))?;
-        let (mut index_file, digest) = hashed.finish();
+        let (mut index_file, digest) = idx_writer.finish().map_err(write_err)?;
         let body_length = index_file.stream_position().map_err(write_err)?;
-        let sampled = sampled_digest(index_file, body_length).map_err(write_err)?;
+        let sampled = sampled_digest(&index_file, body_length).map_err(write_err)?;
         index_file.seek(io::SeekFrom::End(0)).map_err(write_err)?;
         for field in [&digest[..], &body_length.to_le_bytes(), &sampled] {
             index_file.write_all(field).map_err(write_err)?;
@@ -5314,6 +5546,73 @@ mod tests {
         assert_eq!(ties, ["three-0", "three-1000", "three-2000"]);
     }
 
+    /// A stream whose chromosomes each come in one run in start order, as a
+    /// table `tabix` indexes holds them, stores them in the order given, as
+    /// `write` stores what it is given: the two stores are equal byte for
+    /// byte and the whole-file check passes. Each chromosome holds more rows
+    /// than the rows buffer takes. A chromosome that leaves start order after
+    /// others were stored makes the stream store every chromosome by name.
+    #[test]
+    fn chromosomes_streamed_in_order_are_stored_in_the_order_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpd_path = dir.path().join("given.vpd");
+        let reference = dir.path().join("reference.vpd");
+        let column_names: Vec<String> = ["chr", "start", "end", "name"].map(String::from).to_vec();
+        let (config, source) = with_source(&vpd_path, TabixConfig::default());
+        let mut rows = Vec::new();
+        for chr in ["2", "10", "1"] {
+            for i in 0..3000u64 {
+                rows.push(named_row(
+                    chr,
+                    10 + i / 2,
+                    10 + i / 2,
+                    &format!("{chr}-{i}"),
+                ));
+            }
+        }
+        let mut given: Vec<(String, Vec<TabixRecord>)> = Vec::new();
+        for row in &rows {
+            match given.last_mut() {
+                Some((chr, held)) if *chr == row.chr => held.push(row.clone()),
+                _ => given.push((row.chr.clone(), vec![row.clone()])),
+            }
+        }
+
+        let written = streamed(&vpd_path, &column_names, &rows, &config, &source);
+        let expected = BinaryStoreWriter::new(reference.clone())
+            .write(&column_names, &given, &config, &source)
+            .unwrap();
+        assert_eq!(written, expected);
+        assert!(written.1 > 2 * ROWS_BUFFER as u64);
+        assert!(store_bytes(&vpd_path) == store_bytes(&reference));
+        BinaryAnnotator::verify(&vpd_path, &config.file_path).unwrap();
+        let store = BinaryAnnotator::open(&vpd_path, &config).unwrap();
+        let names = |chr: &str| -> Vec<String> {
+            let found = store.query(chr, 12, 12).unwrap();
+            found.into_iter().map(|r| r.columns[3].clone()).collect()
+        };
+        assert_eq!(names("10"), ["10-4", "10-5"]);
+
+        rows.push(named_row("1", 5, 5, "1-below"));
+        let written = streamed(&vpd_path, &column_names, &rows, &config, &source);
+        let expected = BinaryStoreWriter::new(reference.clone())
+            .write(&column_names, &grouped_by_start(&rows), &config, &source)
+            .unwrap();
+        assert_eq!(written, expected);
+        assert!(store_bytes(&vpd_path) == store_bytes(&reference));
+        BinaryAnnotator::verify(&vpd_path, &config.file_path).unwrap();
+        assert_eq!(
+            entries(dir.path()),
+            [
+                "given.table",
+                "given.vpd",
+                "given.vpdi",
+                "reference.vpd",
+                "reference.vpdi"
+            ]
+        );
+    }
+
     /// A chromosome given in two separate runs of rows is one chromosome of
     /// the store: the rows of a start that both runs carry form one position,
     /// in the order given, and a second run lying below the first is sorted
@@ -5583,7 +5882,8 @@ mod tests {
             .unwrap();
         std::mem::forget(stream);
         let left = entries(dir.path());
-        for role in ["data", "rows.0", "starts.0"] {
+        // Rows in start order go straight into the data scratch file.
+        for role in ["data", "starts.0"] {
             let name = format!("kept.vpd.{}.{role}.partial", std::process::id());
             assert!(left.contains(&name), "{name} is not among {left:?}");
         }

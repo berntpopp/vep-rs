@@ -27,11 +27,10 @@
 //!   for mmap-backed zero-copy lookups. The table is read once and each row
 //!   is written as it is read, so the conversion keeps no row in memory.
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -514,8 +513,8 @@ fn check_indexed_columns(input_path: &Path, cfg: &TabixConfig) -> Result<Option<
 ///
 /// The table is read once ([`stream_table`]) and each row is given to the
 /// store's stream as it is read, so no row is kept in memory. With the
-/// verification on, the probes are taken from the spans that read recorded
-/// ([`probe_positions`]) before the store is published, and the published
+/// verification on, the probes are taken from the spans that read kept
+/// ([`probe_positions`]), and the published
 /// store is checked against the table at them ([`verify_concordance`]).
 fn convert_plugin_data(
     input: &str,
@@ -577,7 +576,12 @@ fn convert_plugin_data(
         spans,
         source,
         rows,
-    } = stream_table(input_path, cfg, &writer, table.is_some())?;
+    } = stream_table(
+        input_path,
+        cfg,
+        &writer,
+        table.as_ref().map(|_| Spans::new(verify_all)),
+    )?;
     info!(
         "Read {} across {} in {:.1}s",
         counted(rows, "record"),
@@ -585,10 +589,8 @@ fn convert_plugin_data(
         start.elapsed().as_secs_f64()
     );
 
-    // The span files go when the stream ends, so the probes are taken from
-    // them before the store is published.
     let probes = match (&spans, &table) {
-        (Some(spans), Some(table)) => Some(probe_positions(spans, verify_all, table.last_held())?),
+        (Some(spans), Some(table)) => Some(probe_positions(spans, table.last_held())),
         _ => None,
     };
 
@@ -679,30 +681,39 @@ struct TableRead {
 /// [`TabixConfig::record_end`]), so the store answers a query as the table does.
 /// The stream is begun at the first row placed, or after the last line of a
 /// table without one, so a table refused before that leaves nothing written.
-/// With `keep_spans` each row's span is recorded for the verification
-/// ([`Spans`]). The identity returned is of the bytes this read consumed, the
+/// Each row's span is given to `spans` for the verification ([`Spans`]). The
+/// compressed bytes are read and hashed, and the blocks inflated, on threads
+/// of their own while this thread splits the lines. The identity returned is of the bytes this read consumed, the
 /// file's whole stream, so the store is bound to the content it was built
 /// from whatever replaces the file afterwards.
 fn stream_table(
     path: &Path,
     cfg: &TabixConfig,
     writer: &BinaryStoreWriter,
-    keep_spans: bool,
+    mut spans: Option<Spans>,
 ) -> Result<TableRead> {
     use noodles::bgzf;
 
     let store_refusal = |e: PluginError| anyhow::anyhow!("failed to write binary store: {e}");
+    let read_failed = || format!("failed to read {}", path.display());
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut hashed = ChunkHashed::new(&file);
-    let reader = bgzf::io::Reader::new(&mut hashed);
-    let mut lines = vep_builtins::tabix::BoundedLines::new(BufReader::new(reader), path);
+    let hashed = ChunkHashed::new(file.try_clone().with_context(read_failed)?);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, INFLATING_THREADS);
+    let mut reader = bgzf::io::MultithreadedReader::with_worker_count(
+        std::num::NonZero::new(workers).unwrap_or(std::num::NonZero::<usize>::MIN),
+        hashed,
+    );
+    let mut lines = vep_builtins::tabix::BoundedLines::new(&mut reader, path);
+    // One allocation of cells for every line, emptied before its line goes.
+    let mut spare_cells: Vec<&'static str> = Vec::new();
 
     let mut header_names: Vec<String> = Vec::new();
     let mut header_read = false;
     let mut before_first_row = true;
     let mut stream: Option<BinaryStoreStream> = None;
-    let mut spans = keep_spans.then(Spans::default);
     let mut rows: u64 = 0;
 
     while let Some(line) = lines.next_line() {
@@ -713,7 +724,10 @@ fn stream_table(
             other => anyhow::anyhow!(other.detail()),
         })?;
         // The text [`vep_builtins::tabix::lossy_text`] makes of the line.
-        let line = String::from_utf8_lossy(line);
+        let line = match std::str::from_utf8(line) {
+            Ok(text) => std::borrow::Cow::Borrowed(text),
+            Err(_) => String::from_utf8_lossy(line),
+        };
         if line.is_empty() {
             continue;
         }
@@ -732,7 +746,8 @@ fn stream_table(
             continue;
         }
 
-        let cells: Vec<&str> = line.split('\t').collect();
+        let mut cells = recycled(std::mem::take(&mut spare_cells));
+        split_tabs(&line, &mut cells);
         let bare_header = before_first_row
             && !header_read
             && cells
@@ -746,6 +761,7 @@ fn stream_table(
             continue;
         }
         if cells.len() <= cfg.chr_col || cells.len() <= cfg.start_col {
+            spare_cells = recycled(cells);
             continue;
         }
 
@@ -760,26 +776,26 @@ fn stream_table(
             None => stream.insert(writer.stream(&header_names, cfg).map_err(store_refusal)?),
         };
         if let Some(spans) = &mut spans {
-            spans.record(stream, chr, start, end)?;
+            spans.record(chr, start, end);
         }
         stream
             .push_row(chr, start, end, &cells)
             .map_err(store_refusal)?;
         rows += 1;
+        spare_cells = recycled(cells);
     }
     drop(lines);
 
-    let read_failed = || format!("failed to read {}", path.display());
-    let sha256 = hashed.digest_to_end().with_context(read_failed)?;
+    let sha256 = reader
+        .finish()
+        .and_then(ChunkHashed::digest_to_end)
+        .with_context(read_failed)?;
     let length = file.stream_position().with_context(read_failed)?;
 
     let stream = match stream {
         Some(stream) => stream,
         None => writer.stream(&header_names, cfg).map_err(store_refusal)?,
     };
-    if let Some(spans) = &mut spans {
-        spans.close()?;
-    }
     Ok(TableRead {
         stream,
         spans,
@@ -822,189 +838,111 @@ impl<R: Read> Read for ChunkHashed<R> {
     }
 }
 
-/// The bytes of one row of a span scratch file: a start and an end.
-const SPAN_BYTES: usize = 8 + 8;
+/// The most starts [`Spans`] keeps the rows of, [`SAMPLED_STARTS`] times a
+/// factor that keeps a sample of more than 900 starts once more are read.
+const KEPT_STARTS: u64 = 16 * SAMPLED_STARTS as u64;
 
-/// The spans of the rows a conversion read, which the verification takes its
-/// probes from: what the table holds, whatever the store was given. A
-/// chromosome's spans lie in a scratch file of the store's stream
-/// ([`BinaryStoreStream::span_scratch_path`]), a start and an end a row in the
-/// order the rows were read, so no span is held in memory; of a chromosome
-/// the name and a count are. Only the file of the chromosome being read is
-/// open.
-#[derive(Default)]
-struct Spans {
-    /// The chromosomes, in the order each was first read.
-    chromosomes: Vec<ChromosomeSpans>,
-    /// A chromosome's place in `chromosomes`, by its name.
-    numbers: HashMap<String, usize>,
-    /// The chromosome being read and its scratch file.
-    open: Option<(usize, BufWriter<fs::File>)>,
-    /// The chromosomes' places in the byte order of their names, the order
-    /// the store holds them in; set by [`Self::close`].
-    by_name: Vec<usize>,
+/// The most threads a conversion inflates the table's blocks on.
+const INFLATING_THREADS: usize = 8;
+
+/// `cells` emptied, its allocation kept for the cells of another line: the
+/// cells borrow the line they were split from, which the next read
+/// overwrites.
+fn recycled<'b>(mut cells: Vec<&str>) -> Vec<&'b str> {
+    cells.clear();
+    cells.into_iter().map(|_| "").collect()
 }
 
-/// What [`Spans`] keeps of one chromosome.
-struct ChromosomeSpans {
-    name: String,
-    path: PathBuf,
-    /// The rows read.
-    rows: u64,
-    /// Whether no row came below the start of the row before it.
-    in_order: bool,
-    /// The start of the last row read.
-    last_start: u64,
+/// Appends the cells of `line` to `cells`, as `line.split('\t')` gives them,
+/// testing each byte: a table's cells are short, and `split` starts a search
+/// for each.
+fn split_tabs<'a>(line: &'a str, cells: &mut Vec<&'a str>) {
+    let mut from = 0;
+    for (at, &byte) in line.as_bytes().iter().enumerate() {
+        if byte == b'\t' {
+            cells.push(&line[from..at]);
+            from = at + 1;
+        }
+    }
+    cells.push(&line[from..]);
+}
+
+/// The rows a conversion read that the verification takes its probes from:
+/// what the table holds, whatever the store was given. The table's starts
+/// are numbered in the order they are read, a start read again after
+/// another numbered again, and the spans of the rows of every n-th start
+/// from the first are kept, n the smallest power of two that keeps at most
+/// [`KEPT_STARTS`] starts (1 under `--verify-all`), so a conversion holds no
+/// more as the table grows; [`probe_positions`] samples them.
+struct Spans {
+    every_start: bool,
+    /// The n of the starts kept.
+    stride: u64,
+    /// The starts numbered so far.
+    starts: u64,
+    /// The chromosome and the start of the last row read.
+    last: Option<(usize, u64)>,
+    /// The chromosomes' names, in the order each was first read.
+    names: Vec<String>,
+    /// A chromosome's place in `names`, by its name.
+    numbers: std::collections::HashMap<String, usize>,
+    /// The kept rows: the number of the start, the chromosome, the start
+    /// and the end.
+    kept: Vec<(u64, usize, u64, u64)>,
 }
 
 impl Spans {
-    /// Records the span of one row of `chr`, in a scratch file of `stream`.
-    fn record(
-        &mut self,
-        stream: &mut BinaryStoreStream,
-        chr: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<()> {
-        let reading =
-            matches!(&self.open, Some((number, _)) if self.chromosomes[*number].name == chr);
-        if !reading {
-            self.open_for(stream, chr)?;
+    fn new(every_start: bool) -> Self {
+        Self {
+            every_start,
+            stride: 1,
+            starts: 0,
+            last: None,
+            names: Vec::new(),
+            numbers: std::collections::HashMap::new(),
+            kept: Vec::new(),
         }
-        let Some((number, file)) = self.open.as_mut() else {
-            bail!("no span scratch file is open");
+    }
+
+    /// Records the span of one row of `chr`.
+    fn record(&mut self, chr: &str, start: u64, end: u64) {
+        let number = match self.last {
+            Some((number, _)) if self.names[number] == chr => number,
+            _ => match self.numbers.get(chr) {
+                Some(&number) => number,
+                None => {
+                    self.names.push(chr.to_string());
+                    self.numbers.insert(chr.to_string(), self.names.len() - 1);
+                    self.names.len() - 1
+                }
+            },
         };
-        let chromosome = &mut self.chromosomes[*number];
-        if chromosome.rows > 0 && start < chromosome.last_start {
-            chromosome.in_order = false;
-        }
-        chromosome.rows += 1;
-        chromosome.last_start = start;
-        let mut span = [0u8; SPAN_BYTES];
-        span[..8].copy_from_slice(&start.to_le_bytes());
-        span[8..].copy_from_slice(&end.to_le_bytes());
-        file.write_all(&span)
-            .with_context(|| format!("failed to write scratch file {}", chromosome.path.display()))
-    }
-
-    /// Makes `chr` the chromosome being read: closes the scratch file of the
-    /// one before it and opens that of `chr`, created for a chromosome not
-    /// read before and appended to otherwise.
-    fn open_for(&mut self, stream: &mut BinaryStoreStream, chr: &str) -> Result<()> {
-        self.flush_open()?;
-        let known = self.numbers.get(chr).copied();
-        let number = known.unwrap_or(self.chromosomes.len());
-        if known.is_none() {
-            self.chromosomes.push(ChromosomeSpans {
-                name: chr.to_string(),
-                path: stream.span_scratch_path(number),
-                rows: 0,
-                in_order: true,
-                last_start: 0,
-            });
-            self.numbers.insert(chr.to_string(), number);
-        }
-        let path = &self.chromosomes[number].path;
-        let file = if known.is_none() {
-            fs::File::create(path)
-        } else {
-            fs::File::options().append(true).open(path)
-        }
-        .with_context(|| format!("failed to open scratch file {}", path.display()))?;
-        self.open = Some((number, BufWriter::new(file)));
-        Ok(())
-    }
-
-    /// Writes out and closes the scratch file being written.
-    fn flush_open(&mut self) -> Result<()> {
-        if let Some((number, mut file)) = self.open.take() {
-            let path = &self.chromosomes[number].path;
-            file.flush()
-                .with_context(|| format!("failed to write scratch file {}", path.display()))?;
-        }
-        Ok(())
-    }
-
-    /// Ends the recording: closes the scratch file being written and orders
-    /// the chromosomes by name.
-    fn close(&mut self) -> Result<()> {
-        self.flush_open()?;
-        self.by_name = (0..self.chromosomes.len()).collect();
-        self.by_name
-            .sort_by(|&a, &b| self.chromosomes[a].name.cmp(&self.chromosomes[b].name));
-        Ok(())
-    }
-}
-
-/// The rows of a table as the verification reads them: the chromosomes in the
-/// order the store holds them, the byte order of their names, and a
-/// chromosome's rows sorted by start, the rows of one start in the table's
-/// order.
-trait RowSpans {
-    /// The chromosomes' names, in the store's order.
-    fn chromosomes(&self) -> Vec<&str>;
-
-    /// Hands `visit` the start and the end of each row of the `rank`th
-    /// chromosome of [`Self::chromosomes`], in the store's order.
-    fn each_span(&self, rank: usize, visit: &mut dyn FnMut(u64, u64)) -> Result<()>;
-}
-
-impl RowSpans for Spans {
-    fn chromosomes(&self) -> Vec<&str> {
-        self.by_name
-            .iter()
-            .map(|&number| self.chromosomes[number].name.as_str())
-            .collect()
-    }
-
-    /// A chromosome read in start order is handed over from its scratch file
-    /// as it is read back. One read out of start order is sorted first, a
-    /// stable sort by start of its spans, 16 bytes a row of that chromosome.
-    fn each_span(&self, rank: usize, visit: &mut dyn FnMut(u64, u64)) -> Result<()> {
-        let chromosome = &self.chromosomes[self.by_name[rank]];
-        let read_failed = || format!("failed to read scratch file {}", chromosome.path.display());
-        let mut file = BufReader::new(fs::File::open(&chromosome.path).with_context(read_failed)?);
-        let mut next = || -> Result<(u64, u64)> {
-            let mut span = [0u8; SPAN_BYTES];
-            file.read_exact(&mut span).with_context(read_failed)?;
-            let (start, end) = span.split_at(8);
-            Ok((
-                u64::from_le_bytes(start.try_into()?),
-                u64::from_le_bytes(end.try_into()?),
-            ))
-        };
-        if chromosome.in_order {
-            for _ in 0..chromosome.rows {
-                let (start, end) = next()?;
-                visit(start, end);
+        if self.last != Some((number, start)) {
+            self.last = Some((number, start));
+            self.starts += 1;
+            if !self.every_start && (self.starts - 1) / self.stride >= KEPT_STARTS {
+                self.stride *= 2;
+                let stride = self.stride;
+                self.kept
+                    .retain(|&(numbered, ..)| numbered.is_multiple_of(stride));
             }
-            return Ok(());
         }
-        let mut spans = Vec::new();
-        for _ in 0..chromosome.rows {
-            spans.push(next()?);
+        let numbered = self.starts - 1;
+        if numbered.is_multiple_of(self.stride) {
+            self.kept.push((numbered, number, start, end));
         }
-        spans.sort_by_key(|&(start, _)| start);
-        for (start, end) in spans {
-            visit(start, end);
-        }
-        Ok(())
-    }
-}
-
-/// Records already grouped by chromosome and sorted by start, as
-/// [`read_tabix_records`] returns them.
-#[cfg(test)]
-impl RowSpans for [(String, Vec<vep_builtins::tabix::TabixRecord>)] {
-    fn chromosomes(&self) -> Vec<&str> {
-        self.iter().map(|(chr, _)| chr.as_str()).collect()
     }
 
-    fn each_span(&self, rank: usize, visit: &mut dyn FnMut(u64, u64)) -> Result<()> {
-        for record in &self[rank].1 {
-            visit(record.start, record.end);
+    /// The spans of `grouped`'s rows, read in its order.
+    #[cfg(test)]
+    fn of(grouped: &[(String, Vec<vep_builtins::tabix::TabixRecord>)], every_start: bool) -> Self {
+        let mut spans = Self::new(every_start);
+        for (chr, records) in grouped {
+            for record in records {
+                spans.record(chr, record.start, record.end);
+            }
         }
-        Ok(())
+        spans
     }
 }
 
@@ -1027,6 +965,7 @@ impl RowSpans for [(String, Vec<vep_builtins::tabix::TabixRecord>)] {
 fn read_tabix_records(path: &Path, cfg: &TabixConfig) -> Result<GroupedRecords> {
     use noodles::bgzf;
     use std::collections::BTreeMap;
+    use std::io::BufReader;
     use std::sync::Arc;
 
     let mut file =
@@ -1199,75 +1138,49 @@ fn verify_concordance(
 }
 
 /// The positions the verification probes, sorted and each once: at every
-/// checked start, the start and, for each of the table's records there, its
-/// end, its midpoint, the position past its end and the one before its start,
-/// so a store that loses a record inside its span or returns it outside it
-/// differs from the table at a probe. The position past a record's end is
-/// left out where it lies past `last_held`, the last position the table's
-/// index holds ([`vep_builtins::tabix::TabixAnnotator::last_held`]): the
-/// table's reader returns no row there whatever the file holds, as `tabix`
-/// prints none for a region that starts past that position, so the probe
-/// would compare the store with no read of the table. A record's own
-/// positions past it stay probes, so a store that answers with a record
-/// where the table's reader finds none still differs. The checked starts are
-/// every distinct record start when `verify_all` is set or `source`, the rows
-/// as the conversion read them in the store's order, holds at most
-/// [`SAMPLED_STARTS`] of them; otherwise every n-th from the first, n the
-/// smallest stride that keeps the sample within that count, so a conversion
-/// probes the same positions on every run. The rows are read twice, once to
-/// count their starts and once to take the probes, and only the probes are
-/// held.
-fn probe_positions<S: RowSpans + ?Sized>(
-    source: &S,
-    verify_all: bool,
-    last_held: u64,
-) -> Result<Vec<(&str, u64)>> {
-    let chromosomes = source.chromosomes();
-    let stride = if verify_all {
+/// checked start, for each row there, its start, its end, its midpoint, the position past its
+/// end and the one before its start, so a store that loses a record inside
+/// its span or returns it outside it differs from the table at a probe. The
+/// position past a record's end is left out where it lies past `last_held`,
+/// the last position the table's index holds
+/// ([`vep_builtins::tabix::TabixAnnotator::last_held`]): the table's reader
+/// returns no row there whatever the file holds, as `tabix` prints none for
+/// a region that starts past that position, so the probe would compare the
+/// store with no read of the table. A record's own positions past it stay
+/// probes, so a store that answers with a record where the table's reader
+/// finds none still differs. The checked starts are every start `spans`
+/// kept under `--verify-all` or when it kept at most [`SAMPLED_STARTS`];
+/// otherwise every n-th of them from the first, n the smallest stride that
+/// keeps the sample within that count, so a conversion probes the same
+/// positions on every run.
+fn probe_positions(spans: &Spans, last_held: u64) -> Vec<(&str, u64)> {
+    let kept = spans.starts.div_ceil(spans.stride);
+    let stride = if spans.every_start {
         1
     } else {
-        let mut starts: usize = 0;
-        for rank in 0..chromosomes.len() {
-            let mut last = None;
-            source.each_span(rank, &mut |start, _| {
-                if last.replace(start) != Some(start) {
-                    starts += 1;
-                }
-            })?;
-        }
-        starts.div_ceil(SAMPLED_STARTS).max(1)
+        kept.div_ceil(SAMPLED_STARTS as u64).max(1)
     };
-
     let mut probes = Vec::new();
-    // The starts passed so far, over every chromosome.
-    let mut starts: usize = 0;
-    for (rank, chr) in chromosomes.into_iter().enumerate() {
-        let mut last = None;
-        let mut checked = false;
-        source.each_span(rank, &mut |start, end| {
-            if last.replace(start) != Some(start) {
-                checked = starts.is_multiple_of(stride);
-                starts += 1;
-            }
-            if !checked {
-                return;
-            }
-            // A generic end cell can read below its start, and such a row has
-            // no midpoint.
-            let midpoint = end.checked_sub(start).map(|span| start + span / 2);
-            let positions = [
-                Some(start),
-                Some(end),
-                midpoint,
-                end.checked_add(1).filter(|&past| past <= last_held),
-                start.checked_sub(1),
-            ];
-            probes.extend(positions.into_iter().flatten().map(|pos| (chr, pos)));
-        })?;
+    for &(numbered, number, start, end) in &spans.kept {
+        if !(numbered / spans.stride).is_multiple_of(stride) {
+            continue;
+        }
+        // A generic end cell can read below its start, and such a row has
+        // no midpoint.
+        let midpoint = end.checked_sub(start).map(|span| start + span / 2);
+        let positions = [
+            Some(start),
+            Some(end),
+            midpoint,
+            end.checked_add(1).filter(|&past| past <= last_held),
+            start.checked_sub(1),
+        ];
+        let chr = spans.names[number].as_str();
+        probes.extend(positions.into_iter().flatten().map(|pos| (chr, pos)));
     }
     probes.sort_unstable();
     probes.dedup();
-    Ok(probes)
+    probes
 }
 
 /// Compare `store` with `table` at each of `probes`, `(chromosome, position)`
@@ -3051,7 +2964,8 @@ mod tests {
 
         let vpd = tmp.path().join("svs.tsv.vpd");
         let table = open_table(&cfg).unwrap();
-        let probes = probe_positions(&grouped[..], true, table.last_held()).unwrap();
+        let spans = Spans::of(&grouped, true);
+        let probes = probe_positions(&spans, table.last_held());
         let result = verify_concordance(&vpd, &probes, &cfg, &table);
         assert!(result.is_err(), "no store to verify yet");
         convert_plugin_data(
@@ -3144,7 +3058,8 @@ mod tests {
         assert!(store.query("21", 200, 200).unwrap().is_empty());
         assert_eq!(table.query("21", 200, 200).unwrap().len(), 1);
 
-        let probes = probe_positions(&grouped[..], true, table.last_held()).unwrap();
+        let spans = Spans::of(&grouped, true);
+        let probes = probe_positions(&spans, table.last_held());
         let verified = verify_concordance(&vpd, &probes, &cfg, &table).unwrap();
         assert!(
             verified.mismatches > 0,
@@ -3178,11 +3093,30 @@ mod tests {
         verify_all: bool,
         last_held: u64,
     ) -> Vec<u64> {
-        probe_positions(&[("21".to_string(), records)][..], verify_all, last_held)
-            .unwrap()
-            .into_iter()
-            .map(|(_, position)| position)
-            .collect()
+        probe_positions(
+            &Spans::of(&[("21".to_string(), records)], verify_all),
+            last_held,
+        )
+        .into_iter()
+        .map(|(_, position)| position)
+        .collect()
+    }
+
+    /// A line splits at its tabs as `str::split` splits it.
+    #[test]
+    fn a_line_splits_at_its_tabs_as_split_splits_it() {
+        for line in [
+            "",
+            "\t",
+            "a",
+            "21\t100\tA\tC",
+            "\tlead\t\ttrail\t",
+            "é\tü\t\u{1F600}x",
+        ] {
+            let mut cells = Vec::new();
+            split_tabs(line, &mut cells);
+            assert_eq!(cells, line.split('\t').collect::<Vec<_>>(), "{line:?}");
+        }
     }
 
     /// Each record of a checked start is probed at its start, its end, its
@@ -3191,7 +3125,8 @@ mod tests {
     /// span reaching either end of the position range has no neighbour past
     /// it. Past a thousand starts the default sample is every n-th start from
     /// the first, the same starts on every call, and `--verify-all` takes
-    /// every start.
+    /// every start. Past the starts a conversion keeps, n is a multiple of a
+    /// power of two and the sample keeps more than 900 starts.
     #[test]
     fn probes_cover_each_records_span_and_neighbours_at_a_fixed_stride() {
         let positions = |records, verify_all| probes_within(records, verify_all, u64::MAX);
@@ -3224,6 +3159,11 @@ mod tests {
         let sampled = positions(points(2500), false);
         assert_eq!(sampled.len(), 2502);
         assert_eq!(sampled[..6], [9, 10, 11, 39, 40, 41]);
+        // 40,000 starts are kept at a stride of 4, 10,000 of them, and
+        // sampled at a stride of 4 times 10: 1,000 starts.
+        let kept = positions(points(40_000), false);
+        assert_eq!(kept.len(), 3000);
+        assert_eq!(kept[..6], [9, 10, 11, 409, 410, 411]);
         assert_eq!(sampled, positions(points(2500), false));
         assert_eq!(positions(points(2500), true).len(), 7500);
     }
@@ -3378,7 +3318,7 @@ mod tests {
             verify_probes(
                 &store,
                 &table,
-                &probe_positions(&source[..], true, u64::MAX).unwrap(),
+                &probe_positions(&Spans::of(&source, true), u64::MAX),
                 0,
             )
             .unwrap()
@@ -4195,9 +4135,10 @@ mod tests {
 
     /// The store the conversion streams from a table equals, in both files
     /// and byte for byte, the store written from the table read whole into
-    /// memory ([`read_tabix_records`], then [`BinaryStoreWriter::write`]):
-    /// over chromosomes arriving in another order than the byte order of
-    /// their names, rows sharing a start with differing ends, rows spanning
+    /// memory ([`read_tabix_records`], then [`BinaryStoreWriter::write`]
+    /// given the chromosomes in the order the stream stores them): over
+    /// chromosomes arriving in another order than the byte order of their
+    /// names, rows sharing a start with differing ends, rows spanning
     /// others, a chromosome in two separate blocks, rows out of start order,
     /// a bare header row, a `#` line after the first row, rows too short for
     /// their columns, a zero-based layout with an end column, a header and
@@ -4214,7 +4155,10 @@ mod tests {
             Sampled,
             No,
         }
-        let equal = |name: &str, cfg: &TabixConfig, verified: Verified| -> u64 {
+        // `given` names the chromosomes of a table that holds each in one run
+        // in start order, in the order read, which the store keeps; the
+        // store of any other table holds them by name.
+        let equal = |name: &str, cfg: &TabixConfig, verified: Verified, given: &[&str]| -> u64 {
             let path = &cfg.file_path;
             let streamed = tmp.path().join(format!("{name}.streamed.vpd"));
             let reference = tmp.path().join(format!("{name}.reference.vpd"));
@@ -4226,7 +4170,10 @@ mod tests {
                 matches!(verified, Verified::No),
             )
             .unwrap_or_else(|error| panic!("{name}: {error:#}"));
-            let (column_names, grouped, source) = read_tabix_records(path, cfg).unwrap();
+            let (column_names, mut grouped, source) = read_tabix_records(path, cfg).unwrap();
+            if !given.is_empty() {
+                grouped.sort_by_key(|(chr, _)| given.iter().position(|given| given == chr));
+            }
             let (rows, _, _) = BinaryStoreWriter::new(reference.clone())
                 .write(&column_names, &grouped, cfg, &source)
                 .unwrap();
@@ -4268,7 +4215,15 @@ mod tests {
             ],
             point.clone(),
         );
-        assert_eq!(equal("arrival", &cfg, Verified::EveryStart), 6);
+        assert_eq!(
+            equal(
+                "arrival",
+                &cfg,
+                Verified::EveryStart,
+                &["2", "10", "1", "X"]
+            ),
+            6
+        );
 
         let cfg = indexed(
             "spans",
@@ -4284,7 +4239,7 @@ mod tests {
             ],
             spanned.clone(),
         );
-        assert_eq!(equal("spans", &cfg, Verified::EveryStart), 7);
+        assert_eq!(equal("spans", &cfg, Verified::EveryStart, &[]), 7);
 
         let cfg = plain(
             "blocks",
@@ -4298,7 +4253,7 @@ mod tests {
                 "22\t60\tf",
             ],
         );
-        assert_eq!(equal("blocks", &cfg, Verified::No), 6);
+        assert_eq!(equal("blocks", &cfg, Verified::No, &[]), 6);
 
         let cfg = plain(
             "unsorted",
@@ -4313,7 +4268,7 @@ mod tests {
                 "3\t5\tg",
             ],
         );
-        assert_eq!(equal("unsorted", &cfg, Verified::No), 7);
+        assert_eq!(equal("unsorted", &cfg, Verified::No, &[]), 7);
 
         let cfg = indexed(
             "bare",
@@ -4321,7 +4276,7 @@ mod tests {
             &["21\t100\ta", "21\t200x\tb"],
             point.clone(),
         );
-        assert_eq!(equal("bare", &cfg, Verified::EveryStart), 2);
+        assert_eq!(equal("bare", &cfg, Verified::EveryStart, &[]), 2);
 
         let cfg = plain(
             "comment",
@@ -4333,7 +4288,7 @@ mod tests {
                 "21\t200\tb",
             ],
         );
-        assert_eq!(equal("comment", &cfg, Verified::No), 2);
+        assert_eq!(equal("comment", &cfg, Verified::No, &[]), 2);
 
         let cfg = plain(
             "short",
@@ -4347,7 +4302,7 @@ mod tests {
                 "22\t9",
             ],
         );
-        assert_eq!(equal("short", &cfg, Verified::No), 3);
+        assert_eq!(equal("short", &cfg, Verified::No, &[]), 3);
 
         let cfg = indexed(
             "bed",
@@ -4359,10 +4314,10 @@ mod tests {
                 config
             },
         );
-        assert_eq!(equal("bed", &cfg, Verified::EveryStart), 3);
+        assert_eq!(equal("bed", &cfg, Verified::EveryStart, &[]), 3);
 
         let cfg = plain("header", &["#chrom\tpos\tscore"]);
-        assert_eq!(equal("header", &cfg, Verified::No), 0);
+        assert_eq!(equal("header", &cfg, Verified::No, &[]), 0);
 
         // Two chromosomes, two rows a start, each with enough rows that its
         // rows, position entries and spans pass the buffer they go through.
@@ -4386,7 +4341,7 @@ mod tests {
             &many,
             spanned.clone(),
         );
-        assert_eq!(equal("many", &cfg, Verified::Sampled), 4800);
+        assert_eq!(equal("many", &cfg, Verified::Sampled, &["2", "10"]), 4800);
 
         // The same count of rows shuffled, many a start, sorted by the keys.
         let mut shuffled = vec!["#chrom\tpos\tname".to_string()];
@@ -4396,7 +4351,7 @@ mod tests {
         }));
         let shuffled: Vec<&str> = shuffled.iter().map(String::as_str).collect();
         let cfg = plain("shuffled", &shuffled);
-        assert_eq!(equal("shuffled", &cfg, Verified::No), 8000);
+        assert_eq!(equal("shuffled", &cfg, Verified::No, &[]), 8000);
 
         let left = entries(tmp.path());
         assert!(

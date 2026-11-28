@@ -135,15 +135,17 @@ data path and `.vpdi` path that name one file through a link, are refused.
 The converter reads the data file once and writes each row as it reads it, so
 it keeps no row in memory while it reads: for each chromosome it holds the
 name and a few counts. While it runs it needs room beside the output for the
-store and the rows of one chromosome more, in scratch files it removes.
+store and 20 bytes for each distinct start, in scratch files it removes. A
+data file that gives a chromosome in two runs, or a row below the start
+before it, needs room for the rows read up to there once more.
 
 The converter writes each file whole under a scratch name beside its own and
 renames it into place, the data first and the index last. A run that starts
 while the files are written therefore finds no part-written store. A scratch
 name ends in the converter's process id, a role and `.partial`. The two files
 have the roles `data` and `index`. What the converter keeps of each chromosome
-while it reads has the roles `rows`, `starts` and `spans`, each followed by
-the chromosome's number.
+while it reads has the role `starts` and, in a data file not sorted by
+chromosome and start, `rows`, each followed by the chromosome's number.
 
 An earlier store's index is removed once both scratch files are written
 whole, before they are renamed. A conversion that is refused or fails before

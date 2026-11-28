@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Caches, reference FASTA and the cache tools
   - `vep-cache-converter verify` holds a `.vpd` store to the chunked SHA256 of its index, data file and table, which an open no longer reads; version 5 indexes keep plain SHA256 at open. (#142)
+  - `vep-cache-converter convert-plugin-data` writes a sorted table's rows straight into the store and reads and hashes on worker threads: whole-genome CADD in 27 minutes against 127, Broadwell.
 - Library crates
   - The `vep-plugin` loader is tested at each stage a plugin's load or `run` can fail, and that each failure after `vep_plugin_create` destroys the instance once. (#162)
 
