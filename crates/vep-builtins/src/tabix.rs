@@ -1011,29 +1011,37 @@ impl TabixAnnotator {
             let end_pos = Position::try_from(end.max(1) as usize)
                 .map_err(|e| PluginError::Run(format!("invalid end position: {e}")))?;
             match self.index.query(ref_seq_id, (start_pos..=end_pos).into()) {
-                Ok(found) => chunks.extend(found),
+                Ok(found) => chunks.extend(found.into_iter().map(|chunk| (chunk, end))),
                 // The index refuses a span that ends past its last addressable
                 // position, though the windows short of it may hold records.
                 Err(_) => return self.query_windows(chr, windows),
             }
         }
         let spans = merge_chunks(&chunks);
-        let read = |&(span_start, span_end): &(bgzf::VirtualPosition, bgzf::VirtualPosition)| {
-            self.span_records_by_block(span_start, span_end, slice_bytes, windows, file_chr)
+        let read = |&(span_start, span_end, _): &Span, stop_past: Option<u64>| {
+            self.span_records_by_block(
+                span_start,
+                span_end,
+                slice_bytes,
+                stop_past,
+                windows,
+                file_chr,
+            )
         };
-        // The spans shorter than a slice are read side by side, so a batch of
-        // scattered windows waits on many reads at once rather than one after
-        // another; a longer span holds a slice at a time and is read in turn.
+        // The spans shorter than a slice are read side by side, each only to
+        // past its windows, so a batch of scattered windows waits on many short
+        // reads at once rather than one after another; a longer span holds a
+        // slice at a time and is read in turn.
         let short: Vec<Option<_>> = spans
             .par_iter()
             .map(|span| {
                 let length = span.1.compressed().saturating_sub(span.0.compressed());
-                (length < slice_bytes as u64).then(|| read(span))
+                (length < slice_bytes as u64).then(|| read(span, Some(span.2)))
             })
             .collect();
         let mut records = Vec::new();
         for (span, found) in spans.iter().zip(short) {
-            match found.unwrap_or_else(|| read(span))? {
+            match found.unwrap_or_else(|| read(span, None))? {
                 Some(found) => records.extend(found),
                 None => return self.query_windows(chr, windows),
             }
@@ -1053,12 +1061,16 @@ impl TabixAnnotator {
     /// scanned side by side before the next is read, so a span of any length
     /// holds one slice at a time. The last block of a slice is read for the
     /// line that ends in it alone and opens the next slice, which begins after
-    /// that line when the block before it ends inside one.
+    /// that line when the block before it ends inside one. Under `stop_past`
+    /// the span is one slice whose blocks are inflated as they are read, and
+    /// the read ends with the block after the first whose lines start past
+    /// that base ([`Self::starts_past`]).
     fn span_records_by_block(
         &self,
         span_start: bgzf::VirtualPosition,
         span_end: bgzf::VirtualPosition,
         slice_bytes: usize,
+        stop_past: Option<u64>,
         windows: &[(u64, u64)],
         file_chr: &bstr::BString,
     ) -> Result<Option<Vec<TabixRecord>>, PluginError> {
@@ -1094,6 +1106,8 @@ impl TabixAnnotator {
             open_line_before: false,
         };
         let mut slice_len = 0;
+        let mut texts = stop_past.map(|_| Vec::new());
+        let mut past_windows = false;
         let (last_is_tail, file_ended) = loop {
             let block_offset = blocks.offset();
             let needed = block_offset < end_block
@@ -1101,13 +1115,25 @@ impl TabixAnnotator {
             match blocks.next_block() {
                 Ok(Some(block)) => {
                     slice_len += block.len();
+                    if let (Some(texts), Some(bound)) = (texts.as_mut(), stop_past) {
+                        let Ok(text) = self.inflate_block(&block) else {
+                            return Ok(None);
+                        };
+                        if past_windows {
+                            texts.push(text);
+                            slice.blocks.push(block);
+                            break (true, false);
+                        }
+                        past_windows = self.starts_past(&text, bound, file_chr);
+                        texts.push(text);
+                    }
                     slice.blocks.push(block);
                     if block_offset > end_block {
                         break (true, false);
                     }
-                    if slice_len >= slice_bytes {
+                    if texts.is_none() && slice_len >= slice_bytes {
                         let Some(found) =
-                            self.scan_slice(&mut slice, true, false, windows, file_chr)?
+                            self.scan_slice(&mut slice, None, true, false, windows, file_chr)?
                         else {
                             return Ok(None);
                         };
@@ -1128,8 +1154,14 @@ impl TabixAnnotator {
                 Err(_) => break (false, false),
             }
         };
-        let Some(found) =
-            self.scan_slice(&mut slice, last_is_tail, file_ended, windows, file_chr)?
+        let Some(found) = self.scan_slice(
+            &mut slice,
+            texts,
+            last_is_tail,
+            file_ended,
+            windows,
+            file_chr,
+        )?
         else {
             return Ok(None);
         };
@@ -1143,21 +1175,27 @@ impl TabixAnnotator {
     /// ([`block_line_runs`]), and each block's lines are placed and parsed side
     /// by side. A slice that is not the span's last keeps its last block, read
     /// for the line that ends in it alone, as the first block of the next slice.
+    /// `inflated` holds the blocks' texts when they were inflated as read.
     fn scan_slice(
         &self,
         slice: &mut Slice,
+        inflated: Option<Vec<Vec<u8>>>,
         last_is_tail: bool,
         file_ended: bool,
         windows: &[(u64, u64)],
         file_chr: &bstr::BString,
     ) -> Result<Option<Vec<TabixRecord>>, PluginError> {
-        let Ok(inflated) = slice
-            .blocks
-            .par_iter()
-            .map(|block| self.inflate_block(block))
-            .collect::<Result<Vec<Vec<u8>>, PluginError>>()
-        else {
-            return Ok(None);
+        let inflated = match inflated {
+            Some(texts) => texts,
+            None => match slice
+                .blocks
+                .par_iter()
+                .map(|block| self.inflate_block(block))
+                .collect::<Result<Vec<Vec<u8>>, PluginError>>()
+            {
+                Ok(texts) => texts,
+                Err(_) => return Ok(None),
+            },
         };
         if !slice.open_line_before
             && inflated
@@ -1247,6 +1285,29 @@ impl TabixAnnotator {
             .read_to_end(&mut text)
             .map_err(|e| self.read_error(e))?;
         Ok(text)
+    }
+
+    /// Whether the first whole line after a line end in a block's `text` is a
+    /// row of `file_chr` starting past `bound`: the file is sorted by start
+    /// within a chromosome, so every row of it in a later line starts past
+    /// `bound` too.
+    fn starts_past(&self, text: &[u8], bound: u64, file_chr: &bstr::BString) -> bool {
+        let Some(line) = text
+            .splitn(3, |&b| b == b'\n')
+            .nth(1)
+            .filter(|line| !line.starts_with(b"#"))
+        else {
+            return false;
+        };
+        // A line the block's text does not end is not whole.
+        let first_end = text.iter().position(|&b| b == b'\n').unwrap_or(text.len());
+        if first_end + 1 + line.len() >= text.len() {
+            return false;
+        }
+        let (row, bytes) = self.line_parts(line);
+        self.line_start_bytes(line)
+            .is_some_and(|start| start > bound)
+            && self.record_on(&row, bytes, file_chr).is_some()
     }
 
     /// Query a region using the tabix index and bgzf reader.
@@ -1696,20 +1757,26 @@ fn bgzf_block_size(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-/// The chunks' spans as sorted `(start, end)` virtual positions, two spans
-/// merged when they share a block: a block is read and its lines kept once.
-fn merge_chunks(chunks: &[Chunk]) -> Vec<(bgzf::VirtualPosition, bgzf::VirtualPosition)> {
-    let mut spans: Vec<_> = chunks.iter().map(|c| (c.start(), c.end())).collect();
+/// A span of the file to read, as its `(start, end)` virtual positions, and
+/// the last base a window read in it reaches.
+type Span = (bgzf::VirtualPosition, bgzf::VirtualPosition, u64);
+
+/// The chunks' spans, each chunk with the last base its windows reach, sorted
+/// and merged where two share a block: a block is read and its lines kept once.
+fn merge_chunks(chunks: &[(Chunk, u64)]) -> Vec<Span> {
+    let mut spans: Vec<Span> = chunks
+        .iter()
+        .map(|(c, reach)| (c.start(), c.end(), *reach))
+        .collect();
     spans.sort_unstable();
-    let mut merged: Vec<(bgzf::VirtualPosition, bgzf::VirtualPosition)> = Vec::new();
-    for (start, end) in spans {
+    let mut merged: Vec<Span> = Vec::new();
+    for (start, end, reach) in spans {
         match merged.last_mut() {
-            Some((_, last_end)) if start.compressed() <= last_end.compressed() => {
-                if end > *last_end {
-                    *last_end = end;
-                }
+            Some((_, last_end, last_reach)) if start.compressed() <= last_end.compressed() => {
+                *last_end = (*last_end).max(end);
+                *last_reach = (*last_reach).max(reach);
             }
-            _ => merged.push((start, end)),
+            _ => merged.push((start, end, reach)),
         }
     }
     merged
@@ -5303,16 +5370,16 @@ mod tests {
         let position =
             |block: u64, offset: u16| bgzf::VirtualPosition::try_from((block, offset)).unwrap();
         let chunks = [
-            Chunk::new(position(700, 0), position(900, 40)),
-            Chunk::new(position(0, 10), position(300, 0)),
-            Chunk::new(position(0, 10), position(300, 0)),
-            Chunk::new(position(300, 0), position(500, 20)),
+            (Chunk::new(position(700, 0), position(900, 40)), 90),
+            (Chunk::new(position(0, 10), position(300, 0)), 20),
+            (Chunk::new(position(0, 10), position(300, 0)), 10),
+            (Chunk::new(position(300, 0), position(500, 20)), 30),
         ];
         assert_eq!(
             merge_chunks(&chunks),
             [
-                (position(0, 10), position(500, 20)),
-                (position(700, 0), position(900, 40)),
+                (position(0, 10), position(500, 20), 30),
+                (position(700, 0), position(900, 40), 90),
             ]
         );
     }
@@ -5495,6 +5562,47 @@ mod tests {
         write_tbi(
             &data,
             vec![Chunk::new(position(header_len), position(first.len()))],
+        );
+        let ann = open(data, None);
+        let windows = [(100, 100)];
+        let by_sweep = lines(&ann.query_windows("21", &windows).unwrap());
+        assert_eq!(by_sweep, ["21\t100\tA\tC\t0.5", "21\t100\tA\tG\t0.6"]);
+        assert_eq!(
+            lines(&ann.query_windows_parallel("21", &windows).unwrap()),
+            by_sweep
+        );
+    }
+
+    /// A short span is read only to the block after the first whose lines
+    /// start past its windows, so a block cut short further into the span is
+    /// never entered, as the line-by-line read never enters it; a block whose
+    /// lines past the windows are another chromosome's ends no read.
+    #[test]
+    fn query_windows_parallel_stops_a_short_span_past_its_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("past.tsv.gz");
+        let rows = "21\t50\tA\tC\t0.3\n";
+        let blocks: Vec<Vec<u8>> = [
+            format!("20\t900000\tA\tC\t0.1\n20\t900001\tA\tC\t0.2\n{rows}"),
+            "21\t100\tA\tC\t0.5\n21\t100\tA\tG\t0.6\n21\t40001\tA\tC\t0.7\n".into(),
+            "21\t50000\tA\tC\t0.8\n21\t50001\tA\tC\t0.9\n".into(),
+            "21\t60000\tA\tC\t1.0\n21\t60001\tA\tC\t1.1\n".into(),
+            "21\t70000\tA\tC\t1.2\n21\t70001\tA\tC\t1.3\n".into(),
+        ]
+        .map(String::into_bytes)
+        .into();
+        let slices: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+        let offsets = write_blocks(&data, &slices);
+        let bytes = std::fs::read(&data).unwrap();
+        let cut_inside_last = usize::try_from(offsets[4]).unwrap() + 20;
+        std::fs::write(&data, &bytes[..cut_inside_last]).unwrap();
+        let position = |block: u64, offset: usize| {
+            bgzf::VirtualPosition::try_from((block, u16::try_from(offset).unwrap())).unwrap()
+        };
+        let chr21_at = blocks[0].len() - rows.len();
+        write_tbi(
+            &data,
+            vec![Chunk::new(position(0, chr21_at), position(offsets[4], 5))],
         );
         let ann = open(data, None);
         let windows = [(100, 100)];
