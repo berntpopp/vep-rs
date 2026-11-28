@@ -199,9 +199,15 @@ impl<W: IoWrite> ChunkedSha256<W> {
             .unwrap_or_else(|| Vec::with_capacity(self.chunk_bytes));
         let chunk = std::mem::replace(&mut self.chunk, next);
         let (digest, received) = mpsc::sync_channel(1);
-        rayon::spawn(move || {
+        let hash = move || {
             let _ = digest.send((sha256(&chunk), chunk));
-        });
+        };
+        // A writer on a pool thread hashes in place: waiting there for a job
+        // of the same pool could wait for itself.
+        match rayon::current_thread_index() {
+            Some(_) => hash(),
+            None => rayon::spawn(hash),
+        }
         self.hashing.push_back(received);
         while self.hashing.len() > CHUNKS_HASHING {
             self.take_oldest();
@@ -2844,6 +2850,18 @@ mod tests {
             chunked_sha256_in(&changed, CHUNK),
             chunked_sha256_in(&bytes, CHUNK)
         );
+        // A writer on the only thread of a pool hashes there, where waiting
+        // for a job of that pool would never end.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let on_pool = pool.install(|| {
+            let mut written = ChunkedSha256::with_chunks(io::sink(), CHUNK);
+            written.write_all(&bytes).unwrap();
+            written.finish().1
+        });
+        assert_eq!(on_pool, serial_chunked(&bytes, CHUNK));
         // The store's own chunks: no byte and one byte, which lie in no chunk
         // and in one chunk shorter than the rest.
         for bytes in [&b""[..], &b"x"[..]] {
