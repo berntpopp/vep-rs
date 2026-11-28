@@ -1505,7 +1505,10 @@ fn gunzip_whole(raw: &[u8]) -> Option<Vec<u8>> {
     let mut size = isize.min(raw.len().saturating_mul(32));
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
-        let mut out = vec![0; size];
+        // An allocation that fails leaves the shard to flate2 rather than aborting.
+        let mut out = Vec::new();
+        out.try_reserve_exact(size).ok()?;
+        out.resize(size, 0);
         match decompressor.gzip_decompress(raw, &mut out) {
             Ok(len) => {
                 out.truncate(len);
@@ -2436,9 +2439,10 @@ mod tests {
     }
 
     /// Gzip shapes a `.json.gz` shard can take: one member, two members, a
-    /// last member whose ISIZE understates the first, an empty payload, and the
-    /// broken ones (empty file, header only, truncated, bad CRC, a wrong header
-    /// CRC under FHCRC, a file name longer than flate2 reads, trailing garbage).
+    /// trailer whose ISIZE understates or overstates the first member, an empty
+    /// payload, a payload over 32 times its compressed length, and the broken
+    /// ones (empty file, header only, truncated, bad CRC or ISIZE, a wrong
+    /// header CRC under FHCRC, a file name longer than flate2 reads).
     fn gzip_fixtures() -> Vec<(&'static str, Vec<u8>)> {
         let gz = |data: &[u8]| {
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -2472,6 +2476,9 @@ mod tests {
             ("two members", [gz(b"[1,"), gz(b"2]")].concat()),
             ("understated ISIZE", [one.clone(), gz(b"x")].concat()),
             ("empty payload", gz(b"")),
+            ("zero ISIZE", [gz(b"[1]"), gz(b"")].concat()),
+            ("over 32-fold", gz(&[b' '; 500_000])),
+            ("ISIZE of 2^32 - 1", [one.clone(), vec![0xff; 4]].concat()),
             (
                 "trailing garbage",
                 [one.clone(), b"garbage".to_vec()].concat(),
@@ -2479,6 +2486,11 @@ mod tests {
             ("empty file", Vec::new()),
             ("header only", one[..10].to_vec()),
             ("truncated", one[..one.len() - 9].to_vec()),
+            ("no ISIZE", one[..one.len() - 4].to_vec()),
+            (
+                "bad ISIZE",
+                [&one[..one.len() - 4], &[0, 0, 0, 1][..]].concat(),
+            ),
             ("bad CRC", bad_crc),
             ("wrong header CRC", fhcrc),
         ]
@@ -2518,7 +2530,8 @@ mod tests {
             let fast = gunzip_whole(&raw);
             match name {
                 "one member" | "file name" | "longest file name" | "two members"
-                | "understated ISIZE" | "empty payload" | "trailing garbage" => {
+                | "understated ISIZE" | "empty payload" | "zero ISIZE" | "over 32-fold"
+                | "ISIZE of 2^32 - 1" | "trailing garbage" => {
                     assert_eq!(fast, Some(reference.unwrap()), "{name}")
                 }
                 _ => assert_eq!(fast, None, "{name}"),
