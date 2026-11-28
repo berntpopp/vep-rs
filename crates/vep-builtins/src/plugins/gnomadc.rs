@@ -296,7 +296,7 @@ impl BuiltinPlugin for GnomadcPlugin {
 
         // Each variant reads the shared batch and writes its own fields, so
         // the variants are annotated side by side on the current pool.
-        variants.par_iter_mut().for_each(|variant| {
+        variants.iter_mut().for_each(|variant| {
             if !self.annotates_variant(variant) {
                 return;
             }
