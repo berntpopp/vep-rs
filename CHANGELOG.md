@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads. (#141)
+- `NearestExonJB`, `HGVSIntronOffset`, `Blosum62`, `TSSDistance` and `NMD`, plugins without a batch route of their own, annotate a batch's variants side by side on the run's threads: 39, 30, 16, 9 and 7 percent less wall time on genome-wide ClinVar, 16 threads.
 - Dependencies and tooling
   - The Bioconda recipe `bioconda/vep-rs` names 1.0.0 and the digest of its source archive, `vep-rs-1.0.0.tar.gz`. (#126)
 
@@ -204,7 +205,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - LoFTEE reads a razip-compressed ancestral FASTA (`human_ancestor.fa.rz`), named under `human_ancestor_fa` or found in the working directory on GRCh37. (#124)
   - LoFTEE reads the `conservation_file` database: whole-exon GERP totals on GRCh37, and the PhyloCSF items of `LoF_flags` and `LoF_info` on both assemblies. (#124)
   - LoFTEE is compared with Ensembl VEP on GRCh37 on genome-wide ClinVar, gnomAD v2.1.1 and 1000 Genomes Phase 3, on synthetic conservation data, and the support table lists GRCh37. (#124)
-  - A plugin without its own batch route (`NearestExonJB`, `HGVSIntronOffset`, `NMD`, `Blosum62`, `TSSDistance`) runs a batch's variants side by side on the run's threads.
 
 - Output formats, columns and headers
   - A run that writes a statistics report without a FASTA prints an `INFO:` line saying the `Distribution of variants on chromosome` charts are left out; `--quiet` withholds it. (#124)
