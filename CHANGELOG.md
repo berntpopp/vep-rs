@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The plugin ABI states that `vep_plugin_run` may be called on one instance from several threads at once, and that `vep_plugin_init` gets a non-null pointer at a count of 0. (#162)
   - `LoFTEE` and `Downstream` annotate a batch's variants side by side on the run's threads: 68 and 38 percent less wall time on ClinVar chr21, 16 threads. (#141)
   - `LOEUF` reads each chromosome of its constraint table once and matches variants in memory: 65 percent less wall time on ClinVar chr21 against a 509,650-row table, 16 threads. (#154)
+  - `gnomADc` writes a batch's coverage means for its variants side by side on the run's threads: 15 percent less wall time on whole-genome ClinVar, 16 threads.
   - Tabix tables indexed on their start column alone (`gnomADc`, `CADD`, `SpliceAI` and others) read only each batch's own windows, side by side: 56 percent less wall time for `gnomADc` on ClinVar chr21, 16 threads. (#140)
   - Short spans of start-column tabix tables are read side by side without Linux readahead: 77 percent less wall time on a whole exome with five plugins, cold cache, 16 threads.
   - `GWAS` under `type=sstate` keeps only the four cells it writes of each summary-statistics row once the rows are sorted: 33 percent lower peak memory on a 5.4 million-row file. (#156)
