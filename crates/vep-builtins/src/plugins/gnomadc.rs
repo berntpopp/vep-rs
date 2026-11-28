@@ -25,7 +25,6 @@
 use std::path::Path;
 
 use indexmap::IndexMap;
-use rayon::prelude::*;
 use tracing::debug;
 
 use crate::annotation_store::{open_best_store_with, AnnotationStore};
@@ -294,20 +293,17 @@ impl BuiltinPlugin for GnomadcPlugin {
             return Ok(());
         }
 
-        // Each variant reads the shared batch and writes its own fields, so
-        // the variants are annotated side by side on the current pool.
-        variants.par_iter_mut().for_each(|variant| {
-            if !self.annotates_variant(variant) {
-                return;
-            }
+        for variant in variants
+            .iter_mut()
+            .filter(|variant| self.annotates_variant(variant))
+        {
             let (start, end) = coverage_span(variant);
             let records = batch_result.lookup(table_contig(variant, self.assembly), start, end);
-            if !records.is_empty() {
-                self.write_means(&records, variant);
+            if records.is_empty() {
+                continue;
             }
-        });
-        // The batch's records are freed by one pool job, off the batch's path.
-        rayon::spawn(move || drop(batch_result));
+            self.write_means(&records, variant);
+        }
 
         Ok(())
     }
@@ -472,29 +468,6 @@ mod tests {
         // A column both records lack sums to nothing over the two records.
         assert_eq!(fields["gnomAD_100x_cov"], "0.0000");
         assert_eq!(fields.len(), 11);
-    }
-
-    /// Each variant of a batch is written from its own records, whichever
-    /// thread annotates it, and a variant with none gets no field.
-    #[test]
-    fn every_variant_of_a_batch_reads_its_own_records() {
-        let plugin = plugin(13);
-        let mut variants: Vec<InputVariant> = (1..=2_000).map(|at| variant(at, at)).collect();
-        let records = (1..=2_000)
-            .filter(|at| at % 7 != 0)
-            .map(|at| record(at, &[&format!("{at}.5")]))
-            .collect();
-        plugin
-            .annotate(&mut variants, PrefetchData::new(batch(records)))
-            .unwrap();
-        for (at, variant) in (1..=2_000u64).zip(&variants) {
-            let mean = variant
-                .plugin_data
-                .get("gnomAD_mean_cov")
-                .map(String::as_str);
-            let expected = (at % 7 != 0).then(|| format!("{at}.5000"));
-            assert_eq!(mean, expected.as_deref(), "{at}");
-        }
     }
 
     /// `gnomADc.pm:161`: an insertion (`start` one past `end`) reads the record
