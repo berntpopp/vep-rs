@@ -288,18 +288,12 @@ fn is_perl_whitespace(c: char) -> bool {
     c.is_ascii_whitespace() || c == '\x0B'
 }
 
-/// Escape one CSQ subfield value the way Ensembl VEP does (`OutputFactory/VCF.pm:401-404`):
-/// `,` and `|` become `&`, `;` becomes `%3B`, a run of ASCII whitespace becomes
-/// one `_`. A control character that is not whitespace, which Ensembl VEP writes as it
-/// is, becomes its `%XX` percent-encoding, as the default and tab formats write
-/// it ([`fields::percent_encode_control_bytes`]).
-fn vcf_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    vcf_encode_into(&mut out, value);
-    out
-}
-
-/// [`vcf_encode`] appended to `out`.
+/// Appends one CSQ subfield value to `out`, escaped the way Ensembl VEP does
+/// (`OutputFactory/VCF.pm:401-404`): `,` and `|` become `&`, `;` becomes
+/// `%3B`, a run of ASCII whitespace becomes one `_`. A control character that
+/// is not whitespace, which Ensembl VEP writes as it is, becomes its `%XX`
+/// percent-encoding, as the default and tab formats write it
+/// ([`fields::percent_encode_control_bytes`]).
 fn vcf_encode_into(out: &mut String, value: &str) {
     let mut in_whitespace = false;
     for ch in value.chars() {
@@ -681,6 +675,12 @@ mod tests {
     use smallvec::smallvec;
     use vep_core::consequence::{Consequence, FeatureType, Impact, TranscriptConsequence};
     use vep_core::transcript::Transcript;
+
+    fn vcf_encode(value: &str) -> String {
+        let mut out = String::new();
+        vcf_encode_into(&mut out, value);
+        out
+    }
 
     #[test]
     fn test_csq_header_generation() {

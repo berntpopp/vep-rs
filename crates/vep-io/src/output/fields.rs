@@ -6528,7 +6528,10 @@ mod tests {
             for i in 0..size {
                 let key = format!("P{i}");
                 let value = format!("v{i}");
-                assert_eq!(plugin_value(&key, &variant, None, &options), Some(value.as_str()));
+                assert_eq!(
+                    plugin_value(&key, &variant, None, &options),
+                    Some(value.as_str())
+                );
             }
             assert_eq!(plugin_value("P", &variant, None, &options), None);
             assert_eq!(plugin_value("Absent", &variant, None, &options), None);
